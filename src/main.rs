@@ -123,7 +123,8 @@ impl LlamaModel {
         }
 
         fn read_string(f: &mut File) -> anyhow::Result<Option<String>> {
-            let len = usize::try_from(read_u32(f)?.context("eof")?)?;
+            let len = usize::try_from(read_u32(f)?.context("eof while reading string")?)?;
+           
             read_string_with_len(f, len)
         }
 
@@ -136,7 +137,7 @@ impl LlamaModel {
         let mut fin = std::fs::File::open(fname)?;
 
         {
-            if read_u32(&mut fin)?.context("eof")? != 0x67676d6c {
+            if read_u32(&mut fin)?.context("eof while reading magic")? != 0x67676d6c {
                 anyhow::bail!("invalid model file {fname:?} (bad magic)");
             }
         }
@@ -148,13 +149,13 @@ impl LlamaModel {
         let hparams = {
             let mut hparams = LlamaHParams::default();
 
-            hparams.n_vocab = read_i32(&mut fin)?.context("eof")?;
-            hparams.n_embd = read_i32(&mut fin)?.context("eof")?;
-            hparams.n_mult = read_i32(&mut fin)?.context("eof")?;
-            hparams.n_head = read_i32(&mut fin)?.context("eof")?;
-            hparams.n_layer = read_i32(&mut fin)?.context("eof")?;
-            hparams.n_rot = read_i32(&mut fin)?.context("eof")?;
-            hparams.f16 = read_i32(&mut fin)?.context("eof")?;
+            hparams.n_vocab = read_i32(&mut fin)?.context("eof reading n_vocab")?;
+            hparams.n_embd = read_i32(&mut fin)?.context("eof reading n_embd")?;
+            hparams.n_mult = read_i32(&mut fin)?.context("eof reading n_mult")?;
+            hparams.n_head = read_i32(&mut fin)?.context("eof reading n_head")?;
+            hparams.n_layer = read_i32(&mut fin)?.context("eof reading n_layer")?;
+            hparams.n_rot = read_i32(&mut fin)?.context("eof reading n_rot")?;
+            hparams.f16 = read_i32(&mut fin)?.context("eof reading f16")?;
 
             hparams.n_ctx = n_ctx;
 
@@ -184,7 +185,7 @@ impl LlamaModel {
             let n_vocab = hparams.n_vocab;
 
             for i in 0..n_vocab {
-                let word = read_string(&mut fin)?.context("eof")?;
+                let word = read_string(&mut fin)?.context("eof while reading vocab")?;
                 vocab.token_to_id.insert(word.clone(), i);
                 vocab.id_to_token.insert(i, word.clone());
             }
@@ -417,12 +418,12 @@ impl LlamaModel {
                     let mut nelements = 1;
                     let mut ne = [1, 1];
                     for i in 0..usize::try_from(n_dims)? {
-                        ne[i] = read_i32(&mut fin)?.context("eof")?;
+                        ne[i] = read_i32(&mut fin)?.context("eof while reading ne")?;
                         nelements *= ne[i];
                     }
 
-                    let name =
-                        read_string_with_len(&mut fin, length.try_into()?)?.context("eof")?;
+                    let name = read_string_with_len(&mut fin, length.try_into()?)?
+                        .context("eof while reading name with len")?;
 
                     if !tensors.contains_key(&name) {
                         anyhow::bail!("unknown tensor '{name}' in model_file");
@@ -664,7 +665,7 @@ fn llama_eval(
 
 fn main() -> anyhow::Result<()> {
     simplelog::CombinedLogger::init(vec![simplelog::TermLogger::new(
-        simplelog::LevelFilter::Warn,
+        simplelog::LevelFilter::Info,
         simplelog::Config::default(),
         simplelog::TerminalMode::Mixed,
         simplelog::ColorChoice::Auto,
