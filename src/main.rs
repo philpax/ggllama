@@ -124,7 +124,9 @@ impl LlamaModel {
 
         fn read_string(f: &mut File) -> anyhow::Result<Option<String>> {
             let len = usize::try_from(read_u32(f)?.context("eof while reading string")?)?;
-           
+            if len == 0 {
+                return Ok(Some(String::new()));
+            }
             read_string_with_len(f, len)
         }
 
