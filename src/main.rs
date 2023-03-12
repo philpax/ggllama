@@ -4,15 +4,20 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::Path,
     ptr::NonNull,
+    sync::Mutex,
 };
 
 use anyhow::Context;
 use clap::Parser;
 use ggml_sys::{
-    ggml_blck_size, ggml_context, ggml_free, ggml_init, ggml_init_params, ggml_nbytes,
-    ggml_nelements, ggml_new_tensor_1d, ggml_new_tensor_2d, ggml_tensor, ggml_time_init,
-    ggml_time_us, ggml_type_GGML_TYPE_F16, ggml_type_GGML_TYPE_F32, ggml_type_GGML_TYPE_Q4_0,
-    ggml_type_GGML_TYPE_Q4_1, ggml_type_size, ggml_type_sizef,
+    ggml_add, ggml_blck_size, ggml_build_forward_expand, ggml_cgraph, ggml_context, ggml_cpy,
+    ggml_diag_mask_inf, ggml_element_size, ggml_free, ggml_get_data, ggml_get_rows,
+    ggml_graph_compute, ggml_init, ggml_init_params, ggml_mul, ggml_mul_mat, ggml_nbytes,
+    ggml_nelements, ggml_new_f32, ggml_new_tensor_1d, ggml_new_tensor_2d, ggml_new_tensor_3d,
+    ggml_norm, ggml_permute, ggml_repeat, ggml_reshape_3d, ggml_rope, ggml_scale, ggml_silu,
+    ggml_soft_max, ggml_tensor, ggml_time_init, ggml_time_us, ggml_type_GGML_TYPE_F16,
+    ggml_type_GGML_TYPE_F32, ggml_type_GGML_TYPE_I32, ggml_type_GGML_TYPE_Q4_0,
+    ggml_type_GGML_TYPE_Q4_1, ggml_type_size, ggml_type_sizef, ggml_used_mem, ggml_view_1d,
 };
 use once_cell::sync::Lazy;
 use rand::SeedableRng;
@@ -647,6 +652,10 @@ impl LlamaModel {
     }
 }
 
+const LLAMA_BUF_SIZE_DEFAULT: usize = 512 * 1024 * 1024;
+static LLAMA_BUF: Lazy<Mutex<Box<[u8]>>> =
+    Lazy::new(|| Mutex::new(vec![0u8; LLAMA_BUF_SIZE_DEFAULT].into_boxed_slice()));
+
 // evaluate the transformer
 //
 //   - model:     the model
@@ -665,7 +674,302 @@ fn llama_eval(
     embd_w: &mut Vec<f32>,
     mem_per_token: &mut usize,
 ) -> anyhow::Result<()> {
-    let _ = (model, n_threads, n_past, embd_inp, embd_w, mem_per_token);
+    let N = embd_inp.len();
+
+    let hparams = &model.hparams;
+
+    let n_embd = hparams.n_embd;
+    let n_layer = hparams.n_layer;
+    let n_ctx = hparams.n_ctx;
+    let n_head = hparams.n_head;
+    let n_vocab = hparams.n_vocab;
+    let n_rot = hparams.n_embd / hparams.n_head;
+
+    let d_key = n_embd / n_head;
+
+    if *mem_per_token > 0 && *mem_per_token * N > LLAMA_BUF.lock().unwrap().len() {
+        let buf_size_new = (1.1 * (*mem_per_token * N) as f32) as usize; // add 10% to account for ggml object overhead
+                                                                         //printf("\n%s: reallocating buffer from %zu to %zu bytes\n", __func__, buf_size, buf_size_new);
+
+        // reallocate
+        *LLAMA_BUF.lock().unwrap() = vec![0u8; buf_size_new].into_boxed_slice();
+    }
+
+    let mut buf = LLAMA_BUF.lock().unwrap();
+
+    let ctx0 = NonNull::new(unsafe {
+        ggml_init(ggml_init_params {
+            mem_size: buf.len(),
+            mem_buffer: buf.as_mut_ptr() as *mut _,
+        })
+    })
+    .context("failed to init ctx0")?;
+
+    let mut gf: ggml_cgraph = unsafe { std::mem::zeroed() };
+    gf.n_threads = n_threads;
+
+    let mut embd = NonNull::new(unsafe {
+        ggml_new_tensor_1d(ctx0.as_ptr(), ggml_type_GGML_TYPE_I32, N.try_into()?)
+    })
+    .context("failed to crate embd")?;
+
+    unsafe { std::slice::from_raw_parts_mut(embd.as_mut().data as *mut GptVocabId, N) }
+        .copy_from_slice(embd_inp);
+
+    let mut inpL =
+        unsafe { ggml_get_rows(ctx0.as_ptr(), model.tok_embeddings.as_ptr(), embd.as_ptr()) };
+
+    for il in 0..n_layer {
+        let inpSA = inpL;
+        let mut cur;
+
+        // norm
+        unsafe {
+            cur = ggml_norm(ctx0.as_ptr(), inpL);
+
+            // cur = attention_norm*cur
+            cur = ggml_mul(
+                ctx0.as_ptr(),
+                ggml_repeat(
+                    ctx0.as_ptr(),
+                    model.layers[il as usize].attention_norm.as_ptr(),
+                    cur,
+                ),
+                cur,
+            );
+        }
+
+        // self-attention
+        unsafe {
+            let Qcur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].wq.as_ptr(), cur);
+            let Kcur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].wk.as_ptr(), cur);
+            let Vcur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].wv.as_ptr(), cur);
+
+            // store key and value to memory
+            if N >= 1 {
+                let k = ggml_view_1d(
+                    ctx0.as_ptr(),
+                    model.memory_k.as_ptr(),
+                    i32::try_from(N)? * n_embd,
+                    (ggml_element_size(model.memory_k.as_ptr()) * usize::try_from(n_embd)?)
+                        * usize::try_from(il * n_ctx + n_past)?,
+                );
+                let v = ggml_view_1d(
+                    ctx0.as_ptr(),
+                    model.memory_v.as_ptr(),
+                    i32::try_from(N)? * n_embd,
+                    (ggml_element_size(model.memory_v.as_ptr()) * usize::try_from(n_embd)?)
+                        * usize::try_from(il * n_ctx + n_past)?,
+                );
+
+                ggml_build_forward_expand(&mut gf, ggml_cpy(ctx0.as_ptr(), Kcur, k));
+                ggml_build_forward_expand(&mut gf, ggml_cpy(ctx0.as_ptr(), Vcur, v));
+            }
+
+            // Q = Qcur.contiguous().view(n_embd/n_head, n_head, N).permute(0, 2, 1, 3)
+            let Q = ggml_permute(
+                ctx0.as_ptr(),
+                ggml_rope(
+                    ctx0.as_ptr(),
+                    ggml_cpy(
+                        ctx0.as_ptr(),
+                        Qcur,
+                        ggml_new_tensor_3d(
+                            ctx0.as_ptr(),
+                            ggml_type_GGML_TYPE_F32,
+                            n_embd / n_head,
+                            n_head,
+                            i32::try_from(N)?,
+                        ),
+                    ),
+                    n_past,
+                    n_rot,
+                    0,
+                ),
+                0,
+                2,
+                1,
+                3,
+            );
+
+            // K = Kmem.view(n_embd/n_head, n_head, n_past + N).permute(0, 2, 1, 3)
+            let K = ggml_permute(
+                ctx0.as_ptr(),
+                ggml_rope(
+                    ctx0.as_ptr(),
+                    ggml_reshape_3d(
+                        ctx0.as_ptr(),
+                        ggml_view_1d(
+                            ctx0.as_ptr(),
+                            model.memory_k.as_ptr(),
+                            (n_past + i32::try_from(N)?) * n_embd,
+                            usize::try_from(il * n_ctx * n_embd)?
+                                * ggml_element_size(model.memory_k.as_ptr()),
+                        ),
+                        n_embd / n_head,
+                        n_head,
+                        n_past + i32::try_from(N)?,
+                    ),
+                    n_past,
+                    n_rot,
+                    1,
+                ),
+                0,
+                2,
+                1,
+                3,
+            );
+
+            // K * Q
+            let KQ = ggml_mul_mat(ctx0.as_ptr(), K, Q);
+
+            // KQ_scaled = KQ / sqrt(n_embd/n_head)
+            let KQ_scaled = ggml_scale(
+                ctx0.as_ptr(),
+                KQ,
+                ggml_new_f32(
+                    ctx0.as_ptr(),
+                    1.0 / ((n_embd as f32) / (n_head as f32)).sqrt(),
+                ),
+            );
+
+            // KQ_masked = mask_past(KQ_scaled)
+            let KQ_masked = ggml_diag_mask_inf(ctx0.as_ptr(), KQ_scaled, n_past);
+
+            // KQ = soft_max(KQ_masked)
+            let KQ_soft_max = ggml_soft_max(ctx0.as_ptr(), KQ_masked);
+
+            // V_trans = Vmem.view(n_embd/n_head, n_head, n_past + N).permute(1, 2, 0, 3).contiguous()
+            let V_trans = ggml_permute(
+                ctx0.as_ptr(),
+                ggml_reshape_3d(
+                    ctx0.as_ptr(),
+                    ggml_view_1d(
+                        ctx0.as_ptr(),
+                        model.memory_v.as_ptr(),
+                        (n_past + i32::try_from(N)?) * n_embd,
+                        usize::try_from(il * n_ctx * n_embd)?
+                            * ggml_element_size(model.memory_v.as_ptr()),
+                    ),
+                    n_embd / n_head,
+                    n_head,
+                    n_past + i32::try_from(N)?,
+                ),
+                1,
+                2,
+                0,
+                3,
+            );
+
+            // KQV = transpose(V) * KQ_soft_max
+            let KQV = ggml_mul_mat(ctx0.as_ptr(), V_trans, KQ_soft_max);
+
+            // KQV_merged = KQV.permute(0, 2, 1, 3)
+            let KQV_merged = ggml_permute(ctx0.as_ptr(), KQV, 0, 2, 1, 3);
+
+            // cur = KQV_merged.contiguous().view(n_embd, N)
+            cur = ggml_cpy(
+                ctx0.as_ptr(),
+                KQV_merged,
+                ggml_new_tensor_2d(
+                    ctx0.as_ptr(),
+                    ggml_type_GGML_TYPE_F32,
+                    n_embd,
+                    i32::try_from(N)?,
+                ),
+            );
+
+            // projection (no bias)
+            cur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].wo.as_ptr(), cur);
+        }
+
+        let inpFF = unsafe { ggml_add(ctx0.as_ptr(), cur, inpSA) };
+
+        // feed-forward network
+        unsafe {
+            // norm
+            {
+                cur = ggml_norm(ctx0.as_ptr(), inpFF);
+
+                // cur = ffn_norm*cur
+                cur = ggml_mul(
+                    ctx0.as_ptr(),
+                    ggml_repeat(
+                        ctx0.as_ptr(),
+                        model.layers[il as usize].ffn_norm.as_ptr(),
+                        cur,
+                    ),
+                    cur,
+                );
+            }
+
+            let tmp = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].w3.as_ptr(), cur);
+
+            cur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].w1.as_ptr(), cur);
+
+            // SILU activation
+            cur = ggml_silu(ctx0.as_ptr(), cur);
+
+            cur = ggml_mul(ctx0.as_ptr(), cur, tmp);
+
+            cur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].w2.as_ptr(), cur);
+        }
+
+        cur = unsafe { ggml_add(ctx0.as_ptr(), cur, inpFF) };
+
+        // input for next layer
+        inpL = cur;
+    }
+
+    // norm
+    unsafe {
+        inpL = ggml_norm(ctx0.as_ptr(), inpL);
+
+        // inpL = norm*inpL
+        inpL = ggml_mul(
+            ctx0.as_ptr(),
+            ggml_repeat(ctx0.as_ptr(), model.norm.as_ptr(), inpL),
+            inpL,
+        );
+    }
+
+    // lm_head
+    unsafe {
+        inpL = ggml_mul_mat(ctx0.as_ptr(), model.output.as_ptr(), inpL);
+    }
+
+    // logits -> probs
+    //inpL = ggml_soft_max(ctx0.as_ptr(), inpL);
+
+    // run the computation
+    unsafe { ggml_build_forward_expand(&mut gf, inpL) };
+    unsafe { ggml_graph_compute(ctx0.as_ptr(), &mut gf) };
+
+    //if (n_past%100 == 0) {
+    //    ggml_graph_print   (&gf);
+    //    ggml_graph_dump_dot(&gf, NULL, "gpt-2.dot");
+    //}
+
+    //embd_w.resize(n_vocab*N);
+    //memcpy(embd_w.data(), ggml_get_data(inpL), sizeof(float)*n_vocab*N);
+
+    // return result for just the last token
+    embd_w.resize(n_vocab.try_into()?, Default::default());
+    embd_w[0..n_vocab as usize].copy_from_slice(unsafe {
+        std::slice::from_raw_parts(
+            (ggml_get_data(inpL) as *const f32)
+                .offset(isize::try_from(usize::try_from(n_vocab)? * (N - 1))?),
+            n_vocab as usize,
+        )
+    });
+
+    if *mem_per_token == 0 {
+        *mem_per_token = unsafe { ggml_used_mem(ctx0.as_ptr()) } / N;
+    }
+    //printf("used_mem = %zu\n", ggml_used_mem(ctx0));
+
+    unsafe { ggml_free(ctx0.as_ptr()) };
+
     Ok(())
 }
 
