@@ -206,43 +206,42 @@ impl LlamaModel {
             }
         };
 
-        let mut ctx_size = 0;
+        let mut ctx_size: usize = 0;
 
         {
-            let n_embd = hparams.n_embd;
-            let n_layer = hparams.n_layer;
-            let n_ctx = hparams.n_ctx;
-            let n_vocab = hparams.n_vocab;
+            let n_embd = hparams.n_embd as f32;
+            let n_layer = hparams.n_layer as f32;
+            let n_ctx = hparams.n_ctx as f32;
+            let n_vocab = hparams.n_vocab as f32;
+            let n_ff = n_ff as f32;
 
-            fn ggml_type_sizef_int(wtype: i32) -> i32 {
-                // Assumes it can be casted
-                (unsafe { ggml_type_sizef(wtype) }) as i32
-            }
+            let wtype_sizef = unsafe { ggml_type_sizef(wtype) };
+            let f32_sizef = unsafe { ggml_type_sizef(ggml_type_GGML_TYPE_F32) };
 
             {
-                ctx_size += n_embd * n_vocab * ggml_type_sizef_int(wtype); // tok_embeddings
+                ctx_size += (n_embd * n_vocab * wtype_sizef) as usize; // tok_embeddings
 
-                ctx_size += n_embd * ggml_type_sizef_int(ggml_type_GGML_TYPE_F32); // norm
+                ctx_size += (n_embd * f32_sizef) as usize; // norm
 
-                ctx_size += n_embd * n_vocab * ggml_type_sizef_int(wtype); // output
+                ctx_size += (n_embd * n_vocab * wtype_sizef) as usize; // output
 
-                ctx_size += n_layer * (n_embd * ggml_type_sizef_int(ggml_type_GGML_TYPE_F32)); // attention_norm
+                ctx_size += (n_layer * (n_embd * f32_sizef)) as usize; // attention_norm
 
-                ctx_size += n_layer * (n_embd * n_embd * ggml_type_sizef_int(wtype)); // wq
-                ctx_size += n_layer * (n_embd * n_embd * ggml_type_sizef_int(wtype)); // wk
-                ctx_size += n_layer * (n_embd * n_embd * ggml_type_sizef_int(wtype)); // wv
-                ctx_size += n_layer * (n_embd * n_embd * ggml_type_sizef_int(wtype)); // wo
+                ctx_size += (n_layer * (n_embd * n_embd * wtype_sizef)) as usize; // wq
+                ctx_size += (n_layer * (n_embd * n_embd * wtype_sizef)) as usize; // wk
+                ctx_size += (n_layer * (n_embd * n_embd * wtype_sizef)) as usize; // wv
+                ctx_size += (n_layer * (n_embd * n_embd * wtype_sizef)) as usize; // wo
 
-                ctx_size += n_layer * (n_embd * ggml_type_sizef_int(ggml_type_GGML_TYPE_F32)); // ffn_norm
+                ctx_size += (n_layer * (n_embd * f32_sizef)) as usize; // ffn_norm
 
-                ctx_size += n_layer * (n_ff * n_embd * ggml_type_sizef_int(wtype)); // w1
-                ctx_size += n_layer * (n_ff * n_embd * ggml_type_sizef_int(wtype)); // w2
-                ctx_size += n_layer * (n_ff * n_embd * ggml_type_sizef_int(wtype)); // w3
+                ctx_size += (n_layer * (n_ff * n_embd * wtype_sizef)) as usize; // w1
+                ctx_size += (n_layer * (n_ff * n_embd * wtype_sizef)) as usize; // w2
+                ctx_size += (n_layer * (n_ff * n_embd * wtype_sizef)) as usize; // w3
 
-                ctx_size += n_ctx * n_layer * n_embd * ggml_type_sizef_int(ggml_type_GGML_TYPE_F32); // memory_k
-                ctx_size += n_ctx * n_layer * n_embd * ggml_type_sizef_int(ggml_type_GGML_TYPE_F32); // memory_v
+                ctx_size += (n_ctx * n_layer * n_embd * f32_sizef) as usize; // memory_k
+                ctx_size += (n_ctx * n_layer * n_embd * f32_sizef) as usize; // memory_v
 
-                ctx_size += (5 + 10 * n_layer) * 256; // object overhead
+                ctx_size += ((5 + 10 * hparams.n_layer) * 256) as usize; // object overhead
             }
 
             log::info!("ggml ctx size = {} MB", ctx_size as f32 / (1024.0 * 1024.0));
