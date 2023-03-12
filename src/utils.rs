@@ -10,26 +10,26 @@ pub struct GptParams {
     /// RNG seed
     #[arg(short, long)]
     pub seed: Option<u64>,
-    #[arg(short, long)]
+    #[arg(long)]
     pub n_threads: Option<usize>,
     /// new tokens to predict
-    #[arg(short, long, default_value_t = 128)]
+    #[arg(long, default_value_t = 128)]
     pub n_predict: i32,
-    #[arg(short, long, default_value_t = 64)]
+    #[arg(long, default_value_t = 64)]
     pub repeat_last_n: i32,
 
     /// sampling parameters
-    #[arg(short, long, default_value_t = 40)]
+    #[arg(long, default_value_t = 40)]
     pub top_k: i32,
-    #[arg(short, long, default_value_t = 0.95)]
+    #[arg(long, default_value_t = 0.95)]
     pub top_p: f32,
-    #[arg(short, long, default_value_t = 0.80)]
+    #[arg(long, default_value_t = 0.80)]
     pub temp: f32,
-    #[arg(short, long, default_value_t = 1.30)]
+    #[arg(long, default_value_t = 1.30)]
     pub repeat_penalty: f32,
 
     /// batch size for prompt processing
-    #[arg(short, long, default_value_t = 8)]
+    #[arg(long, default_value_t = 8)]
     pub n_batch: i32,
 
     /// model path
