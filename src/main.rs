@@ -16,9 +16,7 @@ use ggml_sys::{
 };
 use once_cell::sync::Lazy;
 use rand::SeedableRng;
-use utils::{llama_sample_top_p, GptParams, GptVocab};
-
-use crate::utils::{llama_tokenize, GptVocabId};
+use utils::{llama_sample_top_p_top_k, llama_tokenize, GptParams, GptVocab, GptVocabId};
 
 mod utils;
 
@@ -742,8 +740,10 @@ fn main() -> anyhow::Result<()> {
     let last_n_size = usize::try_from(params.repeat_last_n)?;
     let mut last_n_tokens = vec![0; last_n_size];
 
-    let mut i = embd.len();
-    loop {
+    let mut remaining_tokens = params.n_predict;
+    let mut input_consumed = 0;
+
+    while remaining_tokens > 0 {
         if embd.len() > 0 {
             let t_start_us = unsafe { ggml_time_us() };
 
@@ -762,7 +762,9 @@ fn main() -> anyhow::Result<()> {
         n_past += i32::try_from(embd.len())?;
         embd.clear();
 
-        if i >= embd_inp.len() {
+        if embd_inp.len() <= input_consumed {
+            // out of input, sample next token
+            let top_k = params.top_k;
             let top_p = params.top_p;
             let temp = params.temp;
             let repeat_penalty = params.repeat_penalty;
@@ -772,11 +774,12 @@ fn main() -> anyhow::Result<()> {
             let id = {
                 let t_start_sample_us = unsafe { ggml_time_us() };
 
-                let id = llama_sample_top_p(
+                let id = llama_sample_top_p_top_k(
                     &vocab,
                     &logits[logits.len() - usize::try_from(n_vocab)?..],
                     &mut last_n_tokens,
                     repeat_penalty.try_into()?,
+                    top_k.try_into()?,
                     top_p.try_into()?,
                     temp.try_into()?,
                     &mut rng,
@@ -791,17 +794,18 @@ fn main() -> anyhow::Result<()> {
             };
 
             embd.push(id);
+            remaining_tokens -= 1;
         } else {
-            for k in i..embd_inp.len() {
-                embd.push(embd_inp[k]);
+            while embd_inp.len() > input_consumed {
+                embd.push(embd_inp[input_consumed]);
                 last_n_tokens.remove(0);
-                last_n_tokens.push(embd_inp[k]);
+                last_n_tokens.push(embd_inp[input_consumed]);
+                input_consumed += 1;
 
                 if embd.len() > usize::try_from(params.n_batch)? {
                     break;
                 }
             }
-            i += embd.len() - 1;
         }
 
         for id in &embd {
@@ -810,12 +814,6 @@ fn main() -> anyhow::Result<()> {
 
         if embd.last() == Some(&2) {
             log::info!("[end of text]");
-            break;
-        }
-
-        i += 1;
-
-        if i >= (embd_inp.len() + usize::try_from(params.n_predict)?) {
             break;
         }
     }

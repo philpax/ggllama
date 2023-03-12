@@ -14,30 +14,6 @@ fn main() {
         );
     }
 
-    // Make a temporary copy of `ggml.c` and patch it to make it build with MSVC.
-    // This is a very quick and dirty solution to replace some problematic lines.
-    let temp_ggml_path = {
-        let temp_ggml_path = out_dir.join("ggml.c");
-        let contents = std::fs::read_to_string(llama_path.join("ggml.c"))
-            .unwrap()
-            .lines()
-            .map(|l| {
-                l.replace(r#"(uint8_t *) (y "#, r#"(uint8_t *) ((uint8_t *)y "#)
-                    .replace(
-                        r#"(const uint8_t *) (x "#,
-                        r#"(const uint8_t *) ((const uint8_t *)x "#,
-                    )
-                    .replace(
-                        r#"(const uint8_t *) (y "#,
-                        r#"(const uint8_t *) ((const uint8_t *)y "#,
-                    )
-            })
-            .collect::<Vec<String>>()
-            .join("\n");
-        std::fs::write(&temp_ggml_path, contents).unwrap();
-        temp_ggml_path
-    };
-
     // Configure the build.
     let build_target = build_target::target().unwrap();
 
@@ -54,7 +30,10 @@ fn main() {
     let supports_sse3 = supported_features.contains("sse3");
 
     let mut build = cc::Build::new();
-    build.include(llama_path).cpp(true).file(temp_ggml_path);
+    build
+        .include(llama_path)
+        .cpp(true)
+        .file(llama_path.join("ggml.c"));
     // TODO: Apple Silicon support
     if [build_target::Arch::X86, build_target::Arch::X86_64].contains(&build_target.arch) {
         use build_target::Os;

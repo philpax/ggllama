@@ -19,7 +19,6 @@ pub struct GptParams {
     pub repeat_last_n: i32,
 
     /// sampling parameters
-    /// unused
     #[arg(short, long, default_value_t = 40)]
     pub top_k: i32,
     #[arg(short, long, default_value_t = 0.95)]
@@ -114,101 +113,18 @@ pub fn gpt_vocab_init(fname: &str, vocab: &mut GptVocab) -> bool {
     true
 }
 
-// sample next token given probabilities for each embedding
-//
-//   - consider only the top K tokens
-//   - from them, consider only the top tokens with cumulative probability > P
-//
-// TODO: not sure if this implementation is correct
-// TODO: temperature is not implemented
-//
-#[allow(dead_code)]
-pub fn gpt_sample_top_k_top_p(
-    vocab: &GptVocab,
-    logits: &[f32],
-    mut top_k: i32,
-    top_p: f64,
-    temp: f64,
-    rng: &mut impl rand::Rng,
-) -> GptVocabId {
-    let n_logits = vocab.id_to_token.len();
-    assert_eq!(logits.len(), n_logits);
-
-    let mut logits_id: Vec<(f64, GptVocabId)> = vec![];
-    logits_id.reserve(n_logits);
-
-    {
-        let scale = 1.0 / temp;
-
-        logits_id.extend(
-            logits
-                .iter()
-                .enumerate()
-                .map(|(i, logit)| ((*logit as f64) * scale, i.try_into().unwrap())),
-        );
-    }
-
+fn sample_top_k(logits_id: &mut Vec<(f64, GptVocabId)>, top_k: i32) {
     // find the top K tokens
     logits_id.partial_sort(top_k.try_into().unwrap(), |a, b| a.0.total_cmp(&b.0));
     logits_id.resize(top_k.try_into().unwrap(), Default::default());
-
-    let mut maxl: f64 = -f64::INFINITY;
-    for (k, _) in &logits_id {
-        maxl = maxl.max(*k);
-    }
-
-    // compute probs for the top K tokens
-    let mut probs: Vec<f64> = vec![];
-    probs.reserve(logits_id.len());
-
-    let mut sum: f64 = 0.0;
-    for (k, _) in &logits_id {
-        let p: f64 = (k - maxl).exp();
-        probs.push(p);
-        sum += p;
-    }
-
-    // normalize the probs
-    for p in &mut probs {
-        *p /= sum;
-    }
-
-    if top_p < 1.0 {
-        let mut cumsum: f64 = 0.0;
-        for i in 0..top_k {
-            cumsum += probs[usize::try_from(i).unwrap()];
-            if cumsum >= top_p {
-                top_k = i + 1;
-                probs.resize(top_k.try_into().unwrap(), Default::default());
-                logits_id.resize(top_k.try_into().unwrap(), Default::default());
-                break;
-            }
-        }
-
-        cumsum = 1.0 / cumsum;
-        for prob in &mut probs {
-            *prob *= cumsum;
-        }
-    }
-
-    //printf("\n");
-    //for (int i = 0; i < (int) probs.size(); i++) {
-    //    printf("%d: '%s' %f\n", i, vocab.id_to_token.at(logits_id[i].second).c_str(), probs[i]);
-    //}
-    //exit(0);
-
-    let idx = rand::distributions::WeightedIndex::new(&probs)
-        .unwrap()
-        .sample(rng);
-
-    logits_id[idx].1
 }
 
-pub fn llama_sample_top_p(
+pub fn llama_sample_top_p_top_k(
     vocab: &GptVocab,
     logits: &[f32],
     last_n_tokens: &mut Vec<GptVocabId>,
     repeat_penalty: f64,
+    top_k: i32,
     top_p: f64,
     temp: f64,
     rng: &mut impl rand::Rng,
@@ -243,7 +159,7 @@ pub fn llama_sample_top_p(
         }
     }
 
-    logits_id.sort_by(|(k1, _), (k2, _)| k1.total_cmp(k2));
+    sample_top_k(&mut logits_id, top_k);
 
     let mut maxl: f64 = -f64::INFINITY;
     for (k, _) in &logits_id {
