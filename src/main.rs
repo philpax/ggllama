@@ -350,6 +350,7 @@ impl LlamaModel {
             (layers, tok_embeddings, norm, output, tensors)
         };
 
+        // key + value memory
         let (memory_k, memory_v) = {
             let n_embd = hparams.n_embd;
             let n_layer = hparams.n_layer;
@@ -379,7 +380,7 @@ impl LlamaModel {
             (memory_k, memory_v)
         };
 
-        let file_offset = fin.metadata()?.len();
+        let file_offset = fin.stream_position()?;
         std::mem::drop(fin);
 
         for i in 0..n_parts {
@@ -403,7 +404,7 @@ impl LlamaModel {
 
             // load weights
             {
-                let n_tensors = 0;
+                let mut n_tensors = 0;
                 let mut total_size = 0;
 
                 loop {
@@ -527,12 +528,12 @@ impl LlamaModel {
                         }
                         _ => anyhow::bail!("unknown ftype {ftype} in model file"),
                     };
+
                     unsafe {
                         if n_dims == 1 || n_parts == 1 {
-                            if usize::try_from(
-                                (nelements * i32::try_from(bpe)?)
-                                    / ggml_blck_size(tensor.as_ref().type_),
-                            )? != ggml_nbytes(tensor.as_ptr())
+                            if (usize::try_from(nelements)? * usize::try_from(bpe)?)
+                                / usize::try_from(ggml_blck_size(tensor.as_ref().type_))?
+                                != ggml_nbytes(tensor.as_ptr())
                             {
                                 anyhow::bail!(
                                     "tensor '{}' has wrong size in model file: got {}, expected {}",
@@ -556,10 +557,9 @@ impl LlamaModel {
 
                             total_size += ggml_nbytes(tensor.as_ptr());
                         } else {
-                            if usize::try_from(
-                                (nelements * i32::try_from(bpe)?)
-                                    / ggml_blck_size(tensor.as_ref().type_),
-                            )? != (ggml_nbytes(tensor.as_ptr()) / usize::try_from(n_parts)?)
+                            if (usize::try_from(nelements)? * usize::try_from(bpe)?)
+                                / usize::try_from(ggml_blck_size(tensor.as_ref().type_))?
+                                != (ggml_nbytes(tensor.as_ptr()) / usize::try_from(n_parts)?)
                             {
                                 anyhow::bail!(
                                     "tensor '{}' has wrong size in model file: got {}, expected {}",
@@ -580,12 +580,11 @@ impl LlamaModel {
                                 for i1 in 0..ne[1] {
                                     let offset_row = usize::try_from(i1)? * row_size;
                                     let offset = offset_row
-                                        + usize::try_from(
-                                            (part_id * u32::try_from(np0)?)
-                                                / u32::try_from(ggml_blck_size(
-                                                    tensor.as_ref().type_,
-                                                ))?,
-                                        )? * ggml_type_size(tensor.as_ref().type_);
+                                        + (usize::try_from(part_id)? * usize::try_from(np0)?)
+                                            / usize::try_from(ggml_blck_size(
+                                                tensor.as_ref().type_,
+                                            ))?
+                                            * ggml_type_size(tensor.as_ref().type_);
                                     read_into_pointer(
                                         &mut fin,
                                         (tensor.as_mut().data as *mut u8)
@@ -596,14 +595,15 @@ impl LlamaModel {
                             } else {
                                 let np1 = ne[1];
 
-                                let row_size = usize::try_from(
-                                    tensor.as_ref().ne[0] / ggml_blck_size(tensor.as_ref().type_),
-                                )? * ggml_type_size(tensor.as_ref().type_);
+                                let row_size = usize::try_from(tensor.as_ref().ne[0])?
+                                    / usize::try_from(ggml_blck_size(tensor.as_ref().type_))?
+                                    * ggml_type_size(tensor.as_ref().type_);
 
                                 for i1 in 0..ne[1] {
-                                    let offset_row = usize::try_from(
-                                        u32::try_from(i1)? + part_id * u32::try_from(np1)?,
-                                    )? * row_size;
+                                    let offset_row = usize::try_from(i1)?
+                                        + usize::try_from(part_id)?
+                                            * usize::try_from(np1)?
+                                            * row_size;
                                     read_into_pointer(
                                         &mut fin,
                                         (tensor.as_mut().data as *mut u8)
@@ -615,6 +615,11 @@ impl LlamaModel {
                         }
 
                         total_size += ggml_nbytes(tensor.as_ptr()) / usize::try_from(n_parts)?;
+                    }
+
+                    n_tensors += 1;
+                    if n_tensors % 8 == 0 {
+                        log::info!("loaded tensor {n_tensors}");
                     }
                 }
 
