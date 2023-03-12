@@ -1,11 +1,13 @@
 [package]
 edition = "2021"
-name = "ggllama"
+name = "ggml-sys"
 version = "0.1.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
 
-[workspace]
-members = [".", "ggml-sys"]
+[build-dependencies]
+bindgen = "0.64.0"
+build-target = "0.4"
+cc = "1.0"
