@@ -67,7 +67,6 @@ impl Type {
 // past the lifetime of its parent Context. This can be unsound.
 #[derive(Copy, Clone)]
 pub struct Tensor(NonNull<ggml_sys::ggml_tensor>);
-
 impl SysType for Tensor {
     type Sys = ggml_sys::ggml_tensor;
     unsafe fn as_ptr(&self) -> *const Self::Sys {
@@ -351,13 +350,22 @@ impl Context {
     }
 }
 
-pub struct ComputationGraph(ggml_sys::ggml_cgraph);
+pub struct ComputationGraph(Box<ggml_sys::ggml_cgraph>);
 impl ComputationGraph {
     pub fn new(n_threads: usize) -> Result<Self> {
-        let mut cgraph: ggml_sys::ggml_cgraph = unsafe { std::mem::zeroed() };
-        cgraph.n_threads = n_threads.try_into()?;
-
-        Ok(Self(cgraph))
+        Ok(Self(Box::new(ggml_sys::ggml_cgraph {
+            n_nodes: Default::default(),
+            n_leafs: Default::default(),
+            n_threads: n_threads.try_into()?,
+            work_size: Default::default(),
+            work: std::ptr::null_mut(),
+            nodes: [std::ptr::null_mut(); 4096],
+            grads: [std::ptr::null_mut(); 4096],
+            leafs: [std::ptr::null_mut(); 4096],
+            perf_runs: Default::default(),
+            perf_cycles: Default::default(),
+            perf_time_us: Default::default(),
+        })))
     }
 
     pub fn build_forward_expand(&mut self, mut tensor: Tensor) {
@@ -367,10 +375,10 @@ impl ComputationGraph {
 impl SysType for ComputationGraph {
     type Sys = ggml_sys::ggml_cgraph;
     unsafe fn as_ptr(&self) -> *const Self::Sys {
-        &self.0
+        self.0.as_ref()
     }
     unsafe fn as_mut_ptr(&mut self) -> *mut Self::Sys {
-        &mut self.0
+        self.0.as_mut()
     }
 }
 
