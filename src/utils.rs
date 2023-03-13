@@ -119,10 +119,11 @@ fn sample_top_k(logits_id: &mut Vec<(f64, GptVocabId)>, top_k: i32) {
     logits_id.resize(top_k.try_into().unwrap(), Default::default());
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn llama_sample_top_p_top_k(
     vocab: &GptVocab,
     logits: &[f32],
-    last_n_tokens: &mut Vec<GptVocabId>,
+    last_n_tokens: &[GptVocabId],
     repeat_penalty: f64,
     top_k: i32,
     top_p: f64,
@@ -137,24 +138,24 @@ pub fn llama_sample_top_p_top_k(
 
     {
         let scale: f64 = 1.0 / temp;
-        for i in 0..n_logits {
+        for (i, logit) in logits.iter().copied().enumerate() {
             // repetition penalty from CTRL paper (https://arxiv.org/abs/1909.05858)
             // credit https://github.com/facebookresearch/llama/compare/main...shawwn:llama:main
             if last_n_tokens.contains(&i32::try_from(i).unwrap()) {
                 // if score < 0 then repetition penalty has to multiplied to reduce the previous token probability
-                if logits[i] < 0.0 {
+                if logit < 0.0 {
                     logits_id.push((
-                        f64::from(logits[i]) * scale * repeat_penalty,
+                        f64::from(logit) * scale * repeat_penalty,
                         i.try_into().unwrap(),
                     ));
                 } else {
                     logits_id.push((
-                        f64::from(logits[i]) * scale / repeat_penalty,
+                        f64::from(logit) * scale / repeat_penalty,
                         i.try_into().unwrap(),
                     ));
                 }
             } else {
-                logits_id.push((f64::from(logits[i]) * scale, i.try_into().unwrap()));
+                logits_id.push((f64::from(logit) * scale, i.try_into().unwrap()));
             }
         }
     }
@@ -194,8 +195,8 @@ pub fn llama_sample_top_p_top_k(
         }
 
         cumsum = 1.0 / cumsum;
-        for i in 0..probs.len() {
-            probs[i] *= cumsum;
+        for prob in &mut probs {
+            *prob *= cumsum;
         }
     }
 

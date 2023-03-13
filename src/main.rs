@@ -137,7 +137,8 @@ impl LlamaModel {
 
         fn read_into_pointer(f: &mut File, ptr: *mut u8, len: u64) -> anyhow::Result<()> {
             let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len.try_into()?) };
-            f.read(slice)?;
+            let read_len = f.read(slice)?;
+            assert_eq!(read_len, len as usize);
             Ok(())
         }
 
@@ -154,17 +155,24 @@ impl LlamaModel {
 
         // load hparams
         let hparams = {
-            let mut hparams = LlamaHParams::default();
+            let n_vocab = read_i32(&mut fin)?.context("eof reading n_vocab")?;
+            let n_embd = read_i32(&mut fin)?.context("eof reading n_embd")?;
+            let n_mult = read_i32(&mut fin)?.context("eof reading n_mult")?;
+            let n_head = read_i32(&mut fin)?.context("eof reading n_head")?;
+            let n_layer = read_i32(&mut fin)?.context("eof reading n_layer")?;
+            let n_rot = read_i32(&mut fin)?.context("eof reading n_rot")?;
+            let f16 = read_i32(&mut fin)?.context("eof reading f16")?;
 
-            hparams.n_vocab = read_i32(&mut fin)?.context("eof reading n_vocab")?;
-            hparams.n_embd = read_i32(&mut fin)?.context("eof reading n_embd")?;
-            hparams.n_mult = read_i32(&mut fin)?.context("eof reading n_mult")?;
-            hparams.n_head = read_i32(&mut fin)?.context("eof reading n_head")?;
-            hparams.n_layer = read_i32(&mut fin)?.context("eof reading n_layer")?;
-            hparams.n_rot = read_i32(&mut fin)?.context("eof reading n_rot")?;
-            hparams.f16 = read_i32(&mut fin)?.context("eof reading f16")?;
-
-            hparams.n_ctx = n_ctx;
+            let hparams = LlamaHParams {
+                n_vocab,
+                n_ctx,
+                n_embd,
+                n_mult,
+                n_head,
+                n_layer,
+                n_rot,
+                f16,
+            };
 
             n_ff = ((2 * (4 * hparams.n_embd) / 3 + hparams.n_mult - 1) / hparams.n_mult)
                 * hparams.n_mult;
@@ -254,7 +262,7 @@ impl LlamaModel {
 
         let ctx = NonNull::new(unsafe {
             ggml_init(ggml_init_params {
-                mem_size: usize::try_from(ctx_size)?,
+                mem_size: ctx_size,
                 mem_buffer: std::ptr::null_mut(),
             })
         })
@@ -424,9 +432,9 @@ impl LlamaModel {
 
                     let mut nelements = 1;
                     let mut ne = [1, 1];
-                    for i in 0..usize::try_from(n_dims)? {
-                        ne[i] = read_i32(&mut fin)?.context("eof while reading ne")?;
-                        nelements *= ne[i];
+                    for e in ne.iter_mut().take(usize::try_from(n_dims)?) {
+                        *e = read_i32(&mut fin)?.context("eof while reading ne")?;
+                        nelements *= *e;
                     }
 
                     let name = read_string_with_len(&mut fin, length.try_into()?)?
@@ -458,9 +466,9 @@ impl LlamaModel {
                     if name.contains("tok_embeddings") {
                         split_type = 0;
                     } else if name.contains("layers") {
-                        if name.contains("attention.wo.weight") {
-                            split_type = 0;
-                        } else if name.contains("feed_forward.w2.weight") {
+                        if name.contains("attention.wo.weight")
+                            || name.contains("feed_forward.w2.weight")
+                        {
                             split_type = 0;
                         } else {
                             split_type = 1;
@@ -475,12 +483,10 @@ impl LlamaModel {
                         if unsafe { ggml_nelements(tensor.as_ptr()) } != nelements {
                             anyhow::bail!("tensor {} has wrong size in model file", name);
                         }
-                    } else {
-                        if unsafe { ggml_nelements(tensor.as_ptr()) } / (n_parts as i32)
-                            != nelements
-                        {
-                            anyhow::bail!("tensor {} has wrong size in model file", name);
-                        }
+                    } else if unsafe { ggml_nelements(tensor.as_ptr()) } / (n_parts as i32)
+                        != nelements
+                    {
+                        anyhow::bail!("tensor {} has wrong size in model file", name);
                     }
 
                     unsafe {
@@ -489,22 +495,18 @@ impl LlamaModel {
                                 anyhow::bail!("tensor {} has wrong shape in model file: got [{}, {}], expected [{}, {}]",
                                      name, tensor.as_ref().ne[0], tensor.as_ref().ne[1], ne[0], ne[1]);
                             }
-                        } else {
-                            if split_type == 0 {
-                                if tensor.as_ref().ne[0] / (n_parts as i32) != ne[0]
-                                    || tensor.as_ref().ne[1] != ne[1]
-                                {
-                                    anyhow::bail!("tensor {} has wrong shape in model file: got [{}, {}], expected [{}, {}]",
-                                         name, tensor.as_ref().ne[0]/(n_parts as i32), tensor.as_ref().ne[1], ne[0], ne[1]);
-                                }
-                            } else {
-                                if tensor.as_ref().ne[0] != ne[0]
-                                    || tensor.as_ref().ne[1] / (n_parts as i32) != ne[1]
-                                {
-                                    anyhow::bail!("tensor {} has wrong shape in model file: got [{}, {}], expected [{}, {}]",
-                                         name, tensor.as_ref().ne[0], tensor.as_ref().ne[1]/(n_parts as i32), ne[0], ne[1]);
-                                }
+                        } else if split_type == 0 {
+                            if tensor.as_ref().ne[0] / (n_parts as i32) != ne[0]
+                                || tensor.as_ref().ne[1] != ne[1]
+                            {
+                                anyhow::bail!("tensor {} has wrong shape in model file: got [{}, {}], expected [{}, {}]",
+                                     name, tensor.as_ref().ne[0]/(n_parts as i32), tensor.as_ref().ne[1], ne[0], ne[1]);
                             }
+                        } else if tensor.as_ref().ne[0] != ne[0]
+                            || tensor.as_ref().ne[1] / (n_parts as i32) != ne[1]
+                        {
+                            anyhow::bail!("tensor {} has wrong shape in model file: got [{}, {}], expected [{}, {}]",
+                                 name, tensor.as_ref().ne[0], tensor.as_ref().ne[1]/(n_parts as i32), ne[0], ne[1]);
                         }
                     }
 
@@ -536,7 +538,7 @@ impl LlamaModel {
 
                     unsafe {
                         if n_dims == 1 || n_parts == 1 {
-                            if (usize::try_from(nelements)? * usize::try_from(bpe)?)
+                            if (usize::try_from(nelements)? * bpe)
                                 / usize::try_from(ggml_blck_size(tensor.as_ref().type_))?
                                 != ggml_nbytes(tensor.as_ptr())
                             {
@@ -562,7 +564,7 @@ impl LlamaModel {
 
                             total_size += ggml_nbytes(tensor.as_ptr());
                         } else {
-                            if (usize::try_from(nelements)? * usize::try_from(bpe)?)
+                            if (usize::try_from(nelements)? * bpe)
                                 / usize::try_from(ggml_blck_size(tensor.as_ref().type_))?
                                 != (ggml_nbytes(tensor.as_ptr()) / usize::try_from(n_parts)?)
                             {
@@ -674,7 +676,7 @@ fn llama_eval(
     embd_w: &mut Vec<f32>,
     mem_per_token: &mut usize,
 ) -> anyhow::Result<()> {
-    let N = embd_inp.len();
+    let n = embd_inp.len();
 
     let hparams = &model.hparams;
 
@@ -685,10 +687,8 @@ fn llama_eval(
     let n_vocab = hparams.n_vocab;
     let n_rot = hparams.n_embd / hparams.n_head;
 
-    let d_key = n_embd / n_head;
-
-    if *mem_per_token > 0 && *mem_per_token * N > LLAMA_BUF.lock().unwrap().len() {
-        let buf_size_new = (1.1 * (*mem_per_token * N) as f32) as usize; // add 10% to account for ggml object overhead
+    if *mem_per_token > 0 && *mem_per_token * n > LLAMA_BUF.lock().unwrap().len() {
+        let buf_size_new = (1.1 * (*mem_per_token * n) as f32) as usize; // add 10% to account for ggml object overhead
                                                                          //printf("\n%s: reallocating buffer from %zu to %zu bytes\n", __func__, buf_size, buf_size_new);
 
         // reallocate
@@ -709,23 +709,23 @@ fn llama_eval(
     gf.n_threads = n_threads;
 
     let mut embd = NonNull::new(unsafe {
-        ggml_new_tensor_1d(ctx0.as_ptr(), ggml_type_GGML_TYPE_I32, N.try_into()?)
+        ggml_new_tensor_1d(ctx0.as_ptr(), ggml_type_GGML_TYPE_I32, n.try_into()?)
     })
     .context("failed to crate embd")?;
 
-    unsafe { std::slice::from_raw_parts_mut(embd.as_mut().data as *mut GptVocabId, N) }
+    unsafe { std::slice::from_raw_parts_mut(embd.as_mut().data as *mut GptVocabId, n) }
         .copy_from_slice(embd_inp);
 
-    let mut inpL =
+    let mut inp_l =
         unsafe { ggml_get_rows(ctx0.as_ptr(), model.tok_embeddings.as_ptr(), embd.as_ptr()) };
 
     for il in 0..n_layer {
-        let inpSA = inpL;
+        let inp_sa = inp_l;
         let mut cur;
 
         // norm
         unsafe {
-            cur = ggml_norm(ctx0.as_ptr(), inpL);
+            cur = ggml_norm(ctx0.as_ptr(), inp_l);
 
             // cur = attention_norm*cur
             cur = ggml_mul(
@@ -741,45 +741,45 @@ fn llama_eval(
 
         // self-attention
         unsafe {
-            let Qcur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].wq.as_ptr(), cur);
-            let Kcur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].wk.as_ptr(), cur);
-            let Vcur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].wv.as_ptr(), cur);
+            let q_cur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].wq.as_ptr(), cur);
+            let k_cur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].wk.as_ptr(), cur);
+            let v_cur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].wv.as_ptr(), cur);
 
             // store key and value to memory
-            if N >= 1 {
+            if n >= 1 {
                 let k = ggml_view_1d(
                     ctx0.as_ptr(),
                     model.memory_k.as_ptr(),
-                    i32::try_from(N)? * n_embd,
+                    i32::try_from(n)? * n_embd,
                     (ggml_element_size(model.memory_k.as_ptr()) * usize::try_from(n_embd)?)
                         * usize::try_from(il * n_ctx + n_past)?,
                 );
                 let v = ggml_view_1d(
                     ctx0.as_ptr(),
                     model.memory_v.as_ptr(),
-                    i32::try_from(N)? * n_embd,
+                    i32::try_from(n)? * n_embd,
                     (ggml_element_size(model.memory_v.as_ptr()) * usize::try_from(n_embd)?)
                         * usize::try_from(il * n_ctx + n_past)?,
                 );
 
-                ggml_build_forward_expand(&mut gf, ggml_cpy(ctx0.as_ptr(), Kcur, k));
-                ggml_build_forward_expand(&mut gf, ggml_cpy(ctx0.as_ptr(), Vcur, v));
+                ggml_build_forward_expand(&mut gf, ggml_cpy(ctx0.as_ptr(), k_cur, k));
+                ggml_build_forward_expand(&mut gf, ggml_cpy(ctx0.as_ptr(), v_cur, v));
             }
 
             // Q = Qcur.contiguous().view(n_embd/n_head, n_head, N).permute(0, 2, 1, 3)
-            let Q = ggml_permute(
+            let q = ggml_permute(
                 ctx0.as_ptr(),
                 ggml_rope(
                     ctx0.as_ptr(),
                     ggml_cpy(
                         ctx0.as_ptr(),
-                        Qcur,
+                        q_cur,
                         ggml_new_tensor_3d(
                             ctx0.as_ptr(),
                             ggml_type_GGML_TYPE_F32,
                             n_embd / n_head,
                             n_head,
-                            i32::try_from(N)?,
+                            i32::try_from(n)?,
                         ),
                     ),
                     n_past,
@@ -793,7 +793,7 @@ fn llama_eval(
             );
 
             // K = Kmem.view(n_embd/n_head, n_head, n_past + N).permute(0, 2, 1, 3)
-            let K = ggml_permute(
+            let k = ggml_permute(
                 ctx0.as_ptr(),
                 ggml_rope(
                     ctx0.as_ptr(),
@@ -802,13 +802,13 @@ fn llama_eval(
                         ggml_view_1d(
                             ctx0.as_ptr(),
                             model.memory_k.as_ptr(),
-                            (n_past + i32::try_from(N)?) * n_embd,
+                            (n_past + i32::try_from(n)?) * n_embd,
                             usize::try_from(il * n_ctx * n_embd)?
                                 * ggml_element_size(model.memory_k.as_ptr()),
                         ),
                         n_embd / n_head,
                         n_head,
-                        n_past + i32::try_from(N)?,
+                        n_past + i32::try_from(n)?,
                     ),
                     n_past,
                     n_rot,
@@ -821,12 +821,12 @@ fn llama_eval(
             );
 
             // K * Q
-            let KQ = ggml_mul_mat(ctx0.as_ptr(), K, Q);
+            let kq = ggml_mul_mat(ctx0.as_ptr(), k, q);
 
             // KQ_scaled = KQ / sqrt(n_embd/n_head)
-            let KQ_scaled = ggml_scale(
+            let kq_scaled = ggml_scale(
                 ctx0.as_ptr(),
-                KQ,
+                kq,
                 ggml_new_f32(
                     ctx0.as_ptr(),
                     1.0 / ((n_embd as f32) / (n_head as f32)).sqrt(),
@@ -834,26 +834,26 @@ fn llama_eval(
             );
 
             // KQ_masked = mask_past(KQ_scaled)
-            let KQ_masked = ggml_diag_mask_inf(ctx0.as_ptr(), KQ_scaled, n_past);
+            let kq_masked = ggml_diag_mask_inf(ctx0.as_ptr(), kq_scaled, n_past);
 
             // KQ = soft_max(KQ_masked)
-            let KQ_soft_max = ggml_soft_max(ctx0.as_ptr(), KQ_masked);
+            let kq_soft_max = ggml_soft_max(ctx0.as_ptr(), kq_masked);
 
             // V_trans = Vmem.view(n_embd/n_head, n_head, n_past + N).permute(1, 2, 0, 3).contiguous()
-            let V_trans = ggml_permute(
+            let v_trans = ggml_permute(
                 ctx0.as_ptr(),
                 ggml_reshape_3d(
                     ctx0.as_ptr(),
                     ggml_view_1d(
                         ctx0.as_ptr(),
                         model.memory_v.as_ptr(),
-                        (n_past + i32::try_from(N)?) * n_embd,
+                        (n_past + i32::try_from(n)?) * n_embd,
                         usize::try_from(il * n_ctx * n_embd)?
                             * ggml_element_size(model.memory_v.as_ptr()),
                     ),
                     n_embd / n_head,
                     n_head,
-                    n_past + i32::try_from(N)?,
+                    n_past + i32::try_from(n)?,
                 ),
                 1,
                 2,
@@ -862,20 +862,20 @@ fn llama_eval(
             );
 
             // KQV = transpose(V) * KQ_soft_max
-            let KQV = ggml_mul_mat(ctx0.as_ptr(), V_trans, KQ_soft_max);
+            let kqv = ggml_mul_mat(ctx0.as_ptr(), v_trans, kq_soft_max);
 
             // KQV_merged = KQV.permute(0, 2, 1, 3)
-            let KQV_merged = ggml_permute(ctx0.as_ptr(), KQV, 0, 2, 1, 3);
+            let kqv_merged = ggml_permute(ctx0.as_ptr(), kqv, 0, 2, 1, 3);
 
             // cur = KQV_merged.contiguous().view(n_embd, N)
             cur = ggml_cpy(
                 ctx0.as_ptr(),
-                KQV_merged,
+                kqv_merged,
                 ggml_new_tensor_2d(
                     ctx0.as_ptr(),
                     ggml_type_GGML_TYPE_F32,
                     n_embd,
-                    i32::try_from(N)?,
+                    i32::try_from(n)?,
                 ),
             );
 
@@ -883,13 +883,13 @@ fn llama_eval(
             cur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].wo.as_ptr(), cur);
         }
 
-        let inpFF = unsafe { ggml_add(ctx0.as_ptr(), cur, inpSA) };
+        let inp_ff = unsafe { ggml_add(ctx0.as_ptr(), cur, inp_sa) };
 
         // feed-forward network
         unsafe {
             // norm
             {
-                cur = ggml_norm(ctx0.as_ptr(), inpFF);
+                cur = ggml_norm(ctx0.as_ptr(), inp_ff);
 
                 // cur = ffn_norm*cur
                 cur = ggml_mul(
@@ -915,34 +915,34 @@ fn llama_eval(
             cur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].w2.as_ptr(), cur);
         }
 
-        cur = unsafe { ggml_add(ctx0.as_ptr(), cur, inpFF) };
+        cur = unsafe { ggml_add(ctx0.as_ptr(), cur, inp_ff) };
 
         // input for next layer
-        inpL = cur;
+        inp_l = cur;
     }
 
     // norm
     unsafe {
-        inpL = ggml_norm(ctx0.as_ptr(), inpL);
+        inp_l = ggml_norm(ctx0.as_ptr(), inp_l);
 
         // inpL = norm*inpL
-        inpL = ggml_mul(
+        inp_l = ggml_mul(
             ctx0.as_ptr(),
-            ggml_repeat(ctx0.as_ptr(), model.norm.as_ptr(), inpL),
-            inpL,
+            ggml_repeat(ctx0.as_ptr(), model.norm.as_ptr(), inp_l),
+            inp_l,
         );
     }
 
     // lm_head
     unsafe {
-        inpL = ggml_mul_mat(ctx0.as_ptr(), model.output.as_ptr(), inpL);
+        inp_l = ggml_mul_mat(ctx0.as_ptr(), model.output.as_ptr(), inp_l);
     }
 
     // logits -> probs
     //inpL = ggml_soft_max(ctx0.as_ptr(), inpL);
 
     // run the computation
-    unsafe { ggml_build_forward_expand(&mut gf, inpL) };
+    unsafe { ggml_build_forward_expand(&mut gf, inp_l) };
     unsafe { ggml_graph_compute(ctx0.as_ptr(), &mut gf) };
 
     //if (n_past%100 == 0) {
@@ -957,14 +957,14 @@ fn llama_eval(
     embd_w.resize(n_vocab.try_into()?, Default::default());
     embd_w[0..n_vocab as usize].copy_from_slice(unsafe {
         std::slice::from_raw_parts(
-            (ggml_get_data(inpL) as *const f32)
-                .offset(isize::try_from(usize::try_from(n_vocab)? * (N - 1))?),
+            (ggml_get_data(inp_l) as *const f32)
+                .offset(isize::try_from(usize::try_from(n_vocab)? * (n - 1))?),
             n_vocab as usize,
         )
     });
 
     if *mem_per_token == 0 {
-        *mem_per_token = unsafe { ggml_used_mem(ctx0.as_ptr()) } / N;
+        *mem_per_token = unsafe { ggml_used_mem(ctx0.as_ptr()) } / n;
     }
     //printf("used_mem = %zu\n", ggml_used_mem(ctx0));
 
@@ -991,8 +991,7 @@ fn main() -> anyhow::Result<()> {
         _ => Some(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)?
-                .as_secs()
-                .try_into()?,
+                .as_secs(),
         ),
     };
 
@@ -1055,7 +1054,7 @@ fn main() -> anyhow::Result<()> {
     let mut input_consumed = 0;
 
     while remaining_tokens > 0 {
-        if embd.len() > 0 {
+        if !embd.is_empty() {
             let t_start_us = unsafe { ggml_time_us() };
 
             llama_eval(
@@ -1088,9 +1087,9 @@ fn main() -> anyhow::Result<()> {
                 let id = llama_sample_top_p_top_k(
                     &vocab,
                     &logits[logits.len() - usize::try_from(n_vocab)?..],
-                    &mut last_n_tokens,
+                    &last_n_tokens,
                     repeat_penalty.try_into()?,
-                    top_k.try_into()?,
+                    top_k,
                     top_p.try_into()?,
                     temp.try_into()?,
                     &mut rng,
