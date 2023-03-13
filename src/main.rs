@@ -9,16 +9,6 @@ use std::{
 
 use anyhow::Context;
 use clap::Parser;
-use ggml_sys::{
-    ggml_add, ggml_blck_size, ggml_build_forward_expand, ggml_cgraph, ggml_context, ggml_cpy,
-    ggml_diag_mask_inf, ggml_element_size, ggml_free, ggml_get_data, ggml_get_rows,
-    ggml_graph_compute, ggml_init, ggml_init_params, ggml_mul, ggml_mul_mat, ggml_nbytes,
-    ggml_nelements, ggml_new_f32, ggml_new_tensor_1d, ggml_new_tensor_2d, ggml_new_tensor_3d,
-    ggml_norm, ggml_permute, ggml_repeat, ggml_reshape_3d, ggml_rope, ggml_scale, ggml_silu,
-    ggml_soft_max, ggml_tensor, ggml_type_GGML_TYPE_F16, ggml_type_GGML_TYPE_F32,
-    ggml_type_GGML_TYPE_I32, ggml_type_GGML_TYPE_Q4_0, ggml_type_GGML_TYPE_Q4_1, ggml_type_size,
-    ggml_type_sizef, ggml_used_mem, ggml_view_1d,
-};
 use once_cell::sync::Lazy;
 use rand::SeedableRng;
 use utils::{llama_sample_top_p_top_k, llama_tokenize, GptParams, GptVocab, GptVocabId};
@@ -57,42 +47,35 @@ impl Default for LlamaHParams {
 
 struct LlamaLayer {
     // normalization
-    attention_norm: NonNull<ggml_tensor>,
+    attention_norm: ggml::Tensor,
 
     // attention
-    wq: NonNull<ggml_tensor>,
-    wk: NonNull<ggml_tensor>,
-    wv: NonNull<ggml_tensor>,
-    wo: NonNull<ggml_tensor>,
+    wq: ggml::Tensor,
+    wk: ggml::Tensor,
+    wv: ggml::Tensor,
+    wo: ggml::Tensor,
 
     // normalization
-    ffn_norm: NonNull<ggml_tensor>,
+    ffn_norm: ggml::Tensor,
 
     // ff
-    w1: NonNull<ggml_tensor>,
-    w2: NonNull<ggml_tensor>,
-    w3: NonNull<ggml_tensor>,
+    w1: ggml::Tensor,
+    w2: ggml::Tensor,
+    w3: ggml::Tensor,
 }
 
 struct LlamaModel {
     hparams: LlamaHParams,
 
-    tok_embeddings: NonNull<ggml_tensor>,
+    tok_embeddings: ggml::Tensor,
 
-    norm: NonNull<ggml_tensor>,
-    output: NonNull<ggml_tensor>,
+    norm: ggml::Tensor,
+    output: ggml::Tensor,
 
     layers: Vec<LlamaLayer>,
 
-    memory_k: NonNull<ggml_tensor>,
-    memory_v: NonNull<ggml_tensor>,
-
-    ctx: NonNull<ggml_context>,
-}
-impl Drop for LlamaModel {
-    fn drop(&mut self) {
-        unsafe { ggml_free(self.ctx.as_ptr()) }
-    }
+    memory_k: ggml::Tensor,
+    memory_v: ggml::Tensor,
 }
 impl LlamaModel {
     fn load(fname: &Path, vocab: &mut GptVocab, n_ctx: i32) -> anyhow::Result<LlamaModel> {
@@ -133,10 +116,9 @@ impl LlamaModel {
             read_string_with_len(f, len)
         }
 
-        fn read_into_pointer(f: &mut File, ptr: *mut u8, len: u64) -> anyhow::Result<()> {
-            let slice = unsafe { std::slice::from_raw_parts_mut(ptr, len.try_into()?) };
+        fn read_into_slice(f: &mut File, slice: &mut [u8]) -> anyhow::Result<()> {
             let read_len = f.read(slice)?;
-            assert_eq!(read_len, len as usize);
+            assert_eq!(read_len, slice.len() as usize);
             Ok(())
         }
 
@@ -205,10 +187,10 @@ impl LlamaModel {
         }
 
         let wtype = match hparams.f16 {
-            0 => ggml_type_GGML_TYPE_F32,
-            1 => ggml_type_GGML_TYPE_F16,
-            2 => ggml_type_GGML_TYPE_Q4_0,
-            3 => ggml_type_GGML_TYPE_Q4_1,
+            0 => ggml::Type::F32,
+            1 => ggml::Type::F16,
+            2 => ggml::Type::Q4_0,
+            3 => ggml::Type::Q4_1,
             _ => {
                 anyhow::bail!(
                     "invalid model file {fname:?} (bad f16 value {})",
@@ -226,8 +208,8 @@ impl LlamaModel {
             let n_vocab = hparams.n_vocab as f32;
             let n_ff = n_ff as f32;
 
-            let wtype_sizef = unsafe { ggml_type_sizef(wtype) };
-            let f32_sizef = unsafe { ggml_type_sizef(ggml_type_GGML_TYPE_F32) };
+            let wtype_sizef = wtype.sizef()?;
+            let f32_sizef = ggml::Type::F32.sizef()?;
 
             {
                 ctx_size += (n_embd * n_vocab * wtype_sizef) as usize; // tok_embeddings
@@ -258,78 +240,41 @@ impl LlamaModel {
             log::info!("ggml ctx size = {} MB", ctx_size as f32 / (1024.0 * 1024.0));
         }
 
-        let ctx = NonNull::new(unsafe {
-            ggml_init(ggml_init_params {
-                mem_size: ctx_size,
-                mem_buffer: std::ptr::null_mut(),
-            })
-        })
-        .context("ggml_init() failed")?;
+        let mut ctx =
+            ggml::Context::new(ctx_size, None).context("failed to create ggml context")?;
 
         let (layers, tok_embeddings, norm, output, tensors) = {
-            let n_embd = hparams.n_embd;
-            let n_layer = hparams.n_layer;
+            let n_embd = usize::try_from(hparams.n_embd)?;
+            let n_layer = usize::try_from(hparams.n_layer)?;
             // let n_ctx = hparams.n_ctx;
-            let n_vocab = hparams.n_vocab;
+            let n_vocab = usize::try_from(hparams.n_vocab)?;
+            let n_ff = usize::try_from(n_ff)?;
 
             let mut layers = vec![];
 
-            let tok_embeddings =
-                NonNull::new(unsafe { ggml_new_tensor_2d(ctx.as_ptr(), wtype, n_embd, n_vocab) })
-                    .context("failed to create tok_embeddings")?;
-
-            let norm = NonNull::new(unsafe {
-                ggml_new_tensor_1d(ctx.as_ptr(), ggml_type_GGML_TYPE_F32, n_embd)
-            })
-            .context("failed to create norm")?;
-            let output =
-                NonNull::new(unsafe { ggml_new_tensor_2d(ctx.as_ptr(), wtype, n_embd, n_vocab) })
-                    .context("failed to create output")?;
-
+            let tok_embeddings = ctx.new_tensor_2d(wtype, n_embd, n_vocab)?;
+            let norm = ctx.new_tensor_1d(ggml::Type::F32, n_embd)?;
+            let output = ctx.new_tensor_2d(wtype, n_embd, n_vocab)?;
             // map by name
-            let mut tensors: HashMap<String, NonNull<ggml_tensor>> = HashMap::default();
+            let mut tensors: HashMap<String, ggml::Tensor> = HashMap::default();
             tensors.insert("tok_embeddings.weight".to_string(), tok_embeddings);
 
             tensors.insert("norm.weight".to_string(), norm);
             tensors.insert("output.weight".to_string(), output);
 
             for i in 0..n_layer {
-                let attention_norm = NonNull::new(unsafe {
-                    ggml_new_tensor_1d(ctx.as_ptr(), ggml_type_GGML_TYPE_F32, n_embd)
-                })
-                .context("failed to create attention_norm")?;
+                let attention_norm = ctx.new_tensor_1d(ggml::Type::F32, n_embd)?;
 
-                let wq = NonNull::new(unsafe {
-                    ggml_new_tensor_2d(ctx.as_ptr(), wtype, n_embd, n_embd)
-                })
-                .context("failed to create wq")?;
-                let wk = NonNull::new(unsafe {
-                    ggml_new_tensor_2d(ctx.as_ptr(), wtype, n_embd, n_embd)
-                })
-                .context("failed to create wk")?;
-                let wv = NonNull::new(unsafe {
-                    ggml_new_tensor_2d(ctx.as_ptr(), wtype, n_embd, n_embd)
-                })
-                .context("failed to create wv")?;
-                let wo = NonNull::new(unsafe {
-                    ggml_new_tensor_2d(ctx.as_ptr(), wtype, n_embd, n_embd)
-                })
-                .context("failed to create wo")?;
+                let wq = ctx.new_tensor_2d(wtype, n_embd, n_embd)?;
+                let wk = ctx.new_tensor_2d(wtype, n_embd, n_embd)?;
+                let wv = ctx.new_tensor_2d(wtype, n_embd, n_embd)?;
+                let wo = ctx.new_tensor_2d(wtype, n_embd, n_embd)?;
 
-                let ffn_norm = NonNull::new(unsafe {
-                    ggml_new_tensor_1d(ctx.as_ptr(), ggml_type_GGML_TYPE_F32, n_embd)
-                })
-                .context("failed to create ffn_norm")?;
+                let ffn_norm = ctx.new_tensor_1d(ggml::Type::F32, n_embd)?;
 
-                let w1 =
-                    NonNull::new(unsafe { ggml_new_tensor_2d(ctx.as_ptr(), wtype, n_embd, n_ff) })
-                        .context("failed to create w1")?;
-                let w2 =
-                    NonNull::new(unsafe { ggml_new_tensor_2d(ctx.as_ptr(), wtype, n_ff, n_embd) })
-                        .context("failed to create w2")?;
-                let w3 =
-                    NonNull::new(unsafe { ggml_new_tensor_2d(ctx.as_ptr(), wtype, n_embd, n_ff) })
-                        .context("failed to create w3")?;
+                let w1 = ctx.new_tensor_2d(wtype, n_embd, n_ff)?;
+                let w2 = ctx.new_tensor_2d(wtype, n_ff, n_embd)?;
+                let w3 = ctx.new_tensor_2d(wtype, n_embd, n_ff)?;
 
                 // map by name
                 tensors.insert(format!("layers.{i}.attention_norm.weight"), attention_norm);
@@ -368,19 +313,12 @@ impl LlamaModel {
             let n_ctx = hparams.n_ctx;
 
             let n_mem = n_layer * n_ctx;
-            let n_elements = n_embd * n_mem;
+            let n_elements = usize::try_from(n_embd * n_mem)?;
 
-            let memory_k = NonNull::new(unsafe {
-                ggml_new_tensor_1d(ctx.as_ptr(), ggml_type_GGML_TYPE_F32, n_elements)
-            })
-            .context("failed to create memory_k")?;
-            let memory_v = NonNull::new(unsafe {
-                ggml_new_tensor_1d(ctx.as_ptr(), ggml_type_GGML_TYPE_F32, n_elements)
-            })
-            .context("failed to create memory_v")?;
+            let memory_k = ctx.new_tensor_1d(ggml::Type::F32, n_elements)?;
+            let memory_v = ctx.new_tensor_1d(ggml::Type::F32, n_elements)?;
 
-            let memory_size =
-                unsafe { ggml_nbytes(memory_k.as_ptr()) + ggml_nbytes(memory_v.as_ptr()) };
+            let memory_size = memory_k.n_bytes() + memory_v.n_bytes();
 
             log::info!(
                 "memory_size = {} MB, n_mem = {}",
@@ -478,33 +416,32 @@ impl LlamaModel {
                     let mut tensor = *tensors.get(&name).unwrap();
 
                     if n_dims == 1 {
-                        if unsafe { ggml_nelements(tensor.as_ptr()) } != nelements {
+                        if tensor.n_elements()? != usize::try_from(nelements)? {
                             anyhow::bail!("tensor {} has wrong size in model file", name);
                         }
-                    } else if unsafe { ggml_nelements(tensor.as_ptr()) } / (n_parts as i32)
-                        != nelements
+                    } else if tensor.n_elements()? / usize::try_from(n_parts)?
+                        != usize::try_from(nelements)?
                     {
                         anyhow::bail!("tensor {} has wrong size in model file", name);
                     }
 
-                    unsafe {
+                    {
                         if n_dims == 1 {
-                            if tensor.as_ref().ne[0] != ne[0] || tensor.as_ref().ne[1] != ne[1] {
+                            if tensor.ne()[0] != ne[0] || tensor.ne()[1] != ne[1] {
                                 anyhow::bail!("tensor {} has wrong shape in model file: got [{}, {}], expected [{}, {}]",
-                                     name, tensor.as_ref().ne[0], tensor.as_ref().ne[1], ne[0], ne[1]);
+                                     name, tensor.ne()[0], tensor.ne()[1], ne[0], ne[1]);
                             }
                         } else if split_type == 0 {
-                            if tensor.as_ref().ne[0] / (n_parts as i32) != ne[0]
-                                || tensor.as_ref().ne[1] != ne[1]
+                            if tensor.ne()[0] / (n_parts as i32) != ne[0] || tensor.ne()[1] != ne[1]
                             {
                                 anyhow::bail!("tensor {} has wrong shape in model file: got [{}, {}], expected [{}, {}]",
-                                     name, tensor.as_ref().ne[0]/(n_parts as i32), tensor.as_ref().ne[1], ne[0], ne[1]);
+                                     name, tensor.ne()[0]/(n_parts as i32), tensor.ne()[1], ne[0], ne[1]);
                             }
-                        } else if tensor.as_ref().ne[0] != ne[0]
-                            || tensor.as_ref().ne[1] / (n_parts as i32) != ne[1]
+                        } else if tensor.ne()[0] != ne[0]
+                            || tensor.ne()[1] / (n_parts as i32) != ne[1]
                         {
                             anyhow::bail!("tensor {} has wrong shape in model file: got [{}, {}], expected [{}, {}]",
-                                 name, tensor.as_ref().ne[0], tensor.as_ref().ne[1]/(n_parts as i32), ne[0], ne[1]);
+                                 name, tensor.ne()[0], tensor.ne()[1]/(n_parts as i32), ne[0], ne[1]);
                         }
                     }
 
@@ -519,57 +456,49 @@ impl LlamaModel {
                     }
 
                     let bpe = match ftype {
-                        0 => unsafe { ggml_type_size(ggml_type_GGML_TYPE_F32) },
-                        1 => unsafe { ggml_type_size(ggml_type_GGML_TYPE_F16) },
+                        0 => ggml::Type::F32.size(),
+                        1 => ggml::Type::F16.size(),
                         2 => {
-                            let bpe = unsafe { ggml_type_size(ggml_type_GGML_TYPE_Q4_0) };
+                            let bpe = ggml::Type::Q4_0.size();
                             assert_eq!(ne[0] % 64, 0);
                             bpe
                         }
                         3 => {
-                            let bpe = unsafe { ggml_type_size(ggml_type_GGML_TYPE_Q4_1) };
+                            let bpe = ggml::Type::Q4_1.size();
                             assert_eq!(ne[0] % 64, 0);
                             bpe
                         }
                         _ => anyhow::bail!("unknown ftype {ftype} in model file"),
                     };
 
-                    unsafe {
+                    {
                         if n_dims == 1 || n_parts == 1 {
-                            if (usize::try_from(nelements)? * bpe)
-                                / usize::try_from(ggml_blck_size(tensor.as_ref().type_))?
-                                != ggml_nbytes(tensor.as_ptr())
+                            if (usize::try_from(nelements)? * bpe) / tensor.type_().blck_size()?
+                                != tensor.n_bytes()
                             {
                                 anyhow::bail!(
                                     "tensor '{}' has wrong size in model file: got {}, expected {}",
                                     name,
-                                    ggml_nbytes(tensor.as_ptr()),
+                                    tensor.n_bytes(),
                                     nelements * i32::try_from(bpe)?
                                 );
                             }
 
                             if part_id == 0 {
-                                read_into_pointer(
-                                    &mut fin,
-                                    tensor.as_mut().data as *mut u8,
-                                    ggml_nbytes(tensor.as_ptr()).try_into()?,
-                                )?;
+                                read_into_slice(&mut fin, tensor.as_mut_slice_u8())?;
                             } else {
-                                fin.seek(SeekFrom::Current(
-                                    ggml_nbytes(tensor.as_ptr()).try_into()?,
-                                ))?;
+                                fin.seek(SeekFrom::Current(tensor.n_bytes().try_into()?))?;
                             }
 
-                            total_size += ggml_nbytes(tensor.as_ptr());
+                            total_size += tensor.n_bytes();
                         } else {
-                            if (usize::try_from(nelements)? * bpe)
-                                / usize::try_from(ggml_blck_size(tensor.as_ref().type_))?
-                                != (ggml_nbytes(tensor.as_ptr()) / usize::try_from(n_parts)?)
+                            if (usize::try_from(nelements)? * bpe) / tensor.type_().blck_size()?
+                                != (tensor.n_bytes() / usize::try_from(n_parts)?)
                             {
                                 anyhow::bail!(
                                     "tensor '{}' has wrong size in model file: got {}, expected {}",
                                     name,
-                                    ggml_nbytes(tensor.as_ptr()) / usize::try_from(n_parts)?,
+                                    tensor.n_bytes() / usize::try_from(n_parts)?,
                                     nelements * i32::try_from(bpe)?
                                 );
                             }
@@ -577,49 +506,48 @@ impl LlamaModel {
                             if split_type == 0 {
                                 let np0 = ne[0];
 
-                                let row_size = usize::try_from(
-                                    tensor.as_ref().ne[0] / ggml_blck_size(tensor.as_ref().type_),
-                                )? * ggml_type_size(tensor.as_ref().type_);
-                                assert_eq!(row_size, tensor.as_ref().nb[1]);
+                                let row_size = usize::try_from(tensor.ne()[0])?
+                                    / tensor.type_().blck_size()?
+                                    * tensor.type_().size();
+                                assert_eq!(row_size, tensor.nb()[1]);
 
                                 for i1 in 0..ne[1] {
                                     let offset_row = usize::try_from(i1)? * row_size;
                                     let offset = offset_row
                                         + (usize::try_from(part_id)? * usize::try_from(np0)?)
-                                            / usize::try_from(ggml_blck_size(
-                                                tensor.as_ref().type_,
-                                            ))?
-                                            * ggml_type_size(tensor.as_ref().type_);
-                                    read_into_pointer(
+                                            / tensor.type_().blck_size()?
+                                            * tensor.type_().size();
+
+                                    let slice = tensor.as_mut_slice_u8();
+                                    read_into_slice(
                                         &mut fin,
-                                        (tensor.as_mut().data as *mut u8)
-                                            .offset(offset.try_into()?),
-                                        u64::try_from(row_size)? / u64::try_from(n_parts)?,
+                                        &mut slice[offset
+                                            ..offset + (row_size / usize::try_from(n_parts)?)],
                                     )?;
                                 }
                             } else {
                                 let np1 = ne[1];
 
-                                let row_size = usize::try_from(tensor.as_ref().ne[0])?
-                                    / usize::try_from(ggml_blck_size(tensor.as_ref().type_))?
-                                    * ggml_type_size(tensor.as_ref().type_);
+                                let row_size = usize::try_from(tensor.ne()[0])?
+                                    / tensor.type_().blck_size()?
+                                    * tensor.type_().size();
 
                                 for i1 in 0..ne[1] {
                                     let offset_row = usize::try_from(i1)?
                                         + usize::try_from(part_id)?
                                             * usize::try_from(np1)?
                                             * row_size;
-                                    read_into_pointer(
+
+                                    let slice = tensor.as_mut_slice_u8();
+                                    read_into_slice(
                                         &mut fin,
-                                        (tensor.as_mut().data as *mut u8)
-                                            .offset(isize::try_from(offset_row)?),
-                                        row_size.try_into()?,
+                                        &mut slice[offset_row..offset_row + row_size],
                                     )?;
                                 }
                             }
                         }
 
-                        total_size += ggml_nbytes(tensor.as_ptr()) / usize::try_from(n_parts)?;
+                        total_size += tensor.n_bytes() / usize::try_from(n_parts)?;
                     }
 
                     n_tensors += 1;
@@ -646,7 +574,6 @@ impl LlamaModel {
             layers,
             memory_k,
             memory_v,
-            ctx,
         })
     }
 }
@@ -694,253 +621,176 @@ fn llama_eval(
 
     let mut buf = LLAMA_BUF.lock().unwrap();
 
-    let ctx0 = NonNull::new(unsafe {
-        ggml_init(ggml_init_params {
-            mem_size: buf.len(),
-            mem_buffer: buf.as_mut_ptr() as *mut _,
-        })
-    })
-    .context("failed to init ctx0")?;
+    let mut ctx0 = ggml::Context::new(buf.len(), NonNull::new(buf.as_mut_ptr()))
+        .context("failed to create ctx0")?;
 
-    let mut gf: ggml_cgraph = unsafe { std::mem::zeroed() };
-    gf.n_threads = n_threads;
+    let mut gf = ggml::ComputationGraph::new(n_threads.try_into()?)?;
+    let mut embd = ctx0.new_tensor_1d(ggml::Type::I32, n)?;
 
-    let mut embd = NonNull::new(unsafe {
-        ggml_new_tensor_1d(ctx0.as_ptr(), ggml_type_GGML_TYPE_I32, n.try_into()?)
-    })
-    .context("failed to crate embd")?;
+    embd.as_mut_slice().copy_from_slice(embd_inp);
 
-    unsafe { std::slice::from_raw_parts_mut(embd.as_mut().data as *mut GptVocabId, n) }
-        .copy_from_slice(embd_inp);
-
-    let mut inp_l =
-        unsafe { ggml_get_rows(ctx0.as_ptr(), model.tok_embeddings.as_ptr(), embd.as_ptr()) };
+    let mut inp_l = ctx0.get_rows(model.tok_embeddings, embd)?;
 
     for il in 0..n_layer {
         let inp_sa = inp_l;
         let mut cur;
 
         // norm
-        unsafe {
-            cur = ggml_norm(ctx0.as_ptr(), inp_l);
+        {
+            cur = ctx0.norm(inp_l)?;
 
             // cur = attention_norm*cur
-            cur = ggml_mul(
-                ctx0.as_ptr(),
-                ggml_repeat(
-                    ctx0.as_ptr(),
-                    model.layers[il as usize].attention_norm.as_ptr(),
-                    cur,
-                ),
-                cur,
-            );
+            let a = ctx0.repeat(model.layers[il as usize].attention_norm, cur)?;
+            cur = ctx0.mul(a, cur)?;
         }
 
         // self-attention
-        unsafe {
-            let q_cur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].wq.as_ptr(), cur);
-            let k_cur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].wk.as_ptr(), cur);
-            let v_cur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].wv.as_ptr(), cur);
+        {
+            let q_cur = ctx0.mul_mat(model.layers[il as usize].wq, cur)?;
+            let k_cur = ctx0.mul_mat(model.layers[il as usize].wk, cur)?;
+            let v_cur = ctx0.mul_mat(model.layers[il as usize].wv, cur)?;
 
             // store key and value to memory
             if n >= 1 {
-                let k = ggml_view_1d(
-                    ctx0.as_ptr(),
-                    model.memory_k.as_ptr(),
-                    i32::try_from(n)? * n_embd,
-                    (ggml_element_size(model.memory_k.as_ptr()) * usize::try_from(n_embd)?)
+                let k = ctx0.view_1d(
+                    model.memory_k,
+                    n * usize::try_from(n_embd)?,
+                    (model.memory_k.element_size() * usize::try_from(n_embd)?)
                         * usize::try_from(il * n_ctx + n_past)?,
-                );
-                let v = ggml_view_1d(
-                    ctx0.as_ptr(),
-                    model.memory_v.as_ptr(),
-                    i32::try_from(n)? * n_embd,
-                    (ggml_element_size(model.memory_v.as_ptr()) * usize::try_from(n_embd)?)
+                )?;
+                let v = ctx0.view_1d(
+                    model.memory_v,
+                    n * usize::try_from(n_embd)?,
+                    (model.memory_v.element_size() * usize::try_from(n_embd)?)
                         * usize::try_from(il * n_ctx + n_past)?,
-                );
+                )?;
 
-                ggml_build_forward_expand(&mut gf, ggml_cpy(ctx0.as_ptr(), k_cur, k));
-                ggml_build_forward_expand(&mut gf, ggml_cpy(ctx0.as_ptr(), v_cur, v));
+                gf.build_forward_expand(ctx0.cpy(k_cur, k)?);
+                gf.build_forward_expand(ctx0.cpy(v_cur, v)?);
             }
 
             // Q = Qcur.contiguous().view(n_embd/n_head, n_head, N).permute(0, 2, 1, 3)
-            let q = ggml_permute(
-                ctx0.as_ptr(),
-                ggml_rope(
-                    ctx0.as_ptr(),
-                    ggml_cpy(
-                        ctx0.as_ptr(),
-                        q_cur,
-                        ggml_new_tensor_3d(
-                            ctx0.as_ptr(),
-                            ggml_type_GGML_TYPE_F32,
-                            n_embd / n_head,
-                            n_head,
-                            i32::try_from(n)?,
-                        ),
-                    ),
-                    n_past,
-                    n_rot,
-                    0,
-                ),
-                0,
-                2,
-                1,
-                3,
-            );
+            let b = ctx0.new_tensor_3d(
+                ggml::Type::F32,
+                usize::try_from(n_embd / n_head)?,
+                usize::try_from(n_head)?,
+                usize::try_from(n)?,
+            )?;
+            let a = ctx0.cpy(q_cur, b)?;
+            let a = ctx0.rope(a, usize::try_from(n_past)?, usize::try_from(n_rot)?, 0)?;
+            let q = ctx0.permute(a, 0, 2, 1, 3)?;
 
             // K = Kmem.view(n_embd/n_head, n_head, n_past + N).permute(0, 2, 1, 3)
-            let k = ggml_permute(
-                ctx0.as_ptr(),
-                ggml_rope(
-                    ctx0.as_ptr(),
-                    ggml_reshape_3d(
-                        ctx0.as_ptr(),
-                        ggml_view_1d(
-                            ctx0.as_ptr(),
-                            model.memory_k.as_ptr(),
-                            (n_past + i32::try_from(n)?) * n_embd,
-                            usize::try_from(il * n_ctx * n_embd)?
-                                * ggml_element_size(model.memory_k.as_ptr()),
-                        ),
-                        n_embd / n_head,
-                        n_head,
-                        n_past + i32::try_from(n)?,
-                    ),
-                    n_past,
-                    n_rot,
-                    1,
-                ),
-                0,
-                2,
-                1,
-                3,
-            );
+            let a = ctx0.view_1d(
+                model.memory_k,
+                (usize::try_from(n_past)? + n) * usize::try_from(n_embd)?,
+                usize::try_from(il * n_ctx * n_embd)? * model.memory_k.element_size(),
+            )?;
+            let a = ctx0.reshape_3d(
+                a,
+                usize::try_from(n_embd / n_head)?,
+                usize::try_from(n_head)?,
+                usize::try_from(n_past)? + n,
+            )?;
+            let a = ctx0.rope(a, usize::try_from(n_past)?, usize::try_from(n_rot)?, 1)?;
+            let k = ctx0.permute(a, 0, 2, 1, 3)?;
 
             // K * Q
-            let kq = ggml_mul_mat(ctx0.as_ptr(), k, q);
+            let kq = ctx0.mul_mat(k, q)?;
 
             // KQ_scaled = KQ / sqrt(n_embd/n_head)
-            let kq_scaled = ggml_scale(
-                ctx0.as_ptr(),
-                kq,
-                ggml_new_f32(
-                    ctx0.as_ptr(),
-                    1.0 / ((n_embd as f32) / (n_head as f32)).sqrt(),
-                ),
-            );
+            let b = ctx0.new_tensor_f32(1.0 / ((n_embd as f32) / (n_head as f32)).sqrt())?;
+            let kq_scaled = ctx0.scale(kq, b)?;
 
             // KQ_masked = mask_past(KQ_scaled)
-            let kq_masked = ggml_diag_mask_inf(ctx0.as_ptr(), kq_scaled, n_past);
+            let kq_masked = ctx0.diag_mask_inf(kq_scaled, n_past.try_into()?)?;
 
             // KQ = soft_max(KQ_masked)
-            let kq_soft_max = ggml_soft_max(ctx0.as_ptr(), kq_masked);
+            let kq_soft_max = ctx0.soft_max(kq_masked)?;
 
             // V_trans = Vmem.view(n_embd/n_head, n_head, n_past + N).permute(1, 2, 0, 3).contiguous()
-            let v_trans = ggml_permute(
-                ctx0.as_ptr(),
-                ggml_reshape_3d(
-                    ctx0.as_ptr(),
-                    ggml_view_1d(
-                        ctx0.as_ptr(),
-                        model.memory_v.as_ptr(),
-                        (n_past + i32::try_from(n)?) * n_embd,
-                        usize::try_from(il * n_ctx * n_embd)?
-                            * ggml_element_size(model.memory_v.as_ptr()),
-                    ),
-                    n_embd / n_head,
-                    n_head,
-                    n_past + i32::try_from(n)?,
-                ),
-                1,
-                2,
-                0,
-                3,
-            );
+            let a = ctx0.view_1d(
+                model.memory_v,
+                (usize::try_from(n_past)? + n) * usize::try_from(n_embd)?,
+                usize::try_from(il * n_ctx * n_embd)? * model.memory_v.element_size(),
+            )?;
+            let a = ctx0.reshape_3d(
+                a,
+                usize::try_from(n_embd / n_head)?,
+                usize::try_from(n_head)?,
+                usize::try_from(n_past)? + n,
+            )?;
+            let v_trans = ctx0.permute(a, 1, 2, 0, 3)?;
 
             // KQV = transpose(V) * KQ_soft_max
-            let kqv = ggml_mul_mat(ctx0.as_ptr(), v_trans, kq_soft_max);
+            let kqv = ctx0.mul_mat(v_trans, kq_soft_max)?;
 
             // KQV_merged = KQV.permute(0, 2, 1, 3)
-            let kqv_merged = ggml_permute(ctx0.as_ptr(), kqv, 0, 2, 1, 3);
+            let kqv_merged = ctx0.permute(kqv, 0, 2, 1, 3)?;
 
             // cur = KQV_merged.contiguous().view(n_embd, N)
-            cur = ggml_cpy(
-                ctx0.as_ptr(),
-                kqv_merged,
-                ggml_new_tensor_2d(
-                    ctx0.as_ptr(),
-                    ggml_type_GGML_TYPE_F32,
-                    n_embd,
-                    i32::try_from(n)?,
-                ),
-            );
+            let b = ctx0.new_tensor_2d(ggml::Type::F32, usize::try_from(n_embd)?, n)?;
+            cur = ctx0.cpy(kqv_merged, b)?;
 
             // projection (no bias)
-            cur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].wo.as_ptr(), cur);
+            cur = ctx0.mul_mat(model.layers[il as usize].wo, cur)?;
         }
 
-        let inp_ff = unsafe { ggml_add(ctx0.as_ptr(), cur, inp_sa) };
+        let inp_ff = ctx0.add(cur, inp_sa)?;
 
         // feed-forward network
-        unsafe {
+        {
             // norm
             {
-                cur = ggml_norm(ctx0.as_ptr(), inp_ff);
+                cur = ctx0.norm(inp_ff)?;
 
                 // cur = ffn_norm*cur
-                cur = ggml_mul(
-                    ctx0.as_ptr(),
-                    ggml_repeat(
-                        ctx0.as_ptr(),
-                        model.layers[il as usize].ffn_norm.as_ptr(),
-                        cur,
-                    ),
-                    cur,
-                );
+                let a = ctx0.repeat(model.layers[il as usize].ffn_norm, cur)?;
+                cur = ctx0.mul(a, cur)?;
             }
 
-            let tmp = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].w3.as_ptr(), cur);
+            let tmp = ctx0.mul_mat(model.layers[il as usize].w3, cur)?;
 
-            cur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].w1.as_ptr(), cur);
+            cur = ctx0.mul_mat(model.layers[il as usize].w1, cur)?;
 
             // SILU activation
-            cur = ggml_silu(ctx0.as_ptr(), cur);
+            cur = ctx0.silu(cur)?;
 
-            cur = ggml_mul(ctx0.as_ptr(), cur, tmp);
+            cur = ctx0.mul(cur, tmp)?;
 
-            cur = ggml_mul_mat(ctx0.as_ptr(), model.layers[il as usize].w2.as_ptr(), cur);
+            cur = ctx0.mul_mat(model.layers[il as usize].w2, cur)?;
         }
 
-        cur = unsafe { ggml_add(ctx0.as_ptr(), cur, inp_ff) };
+        cur = ctx0.add(cur, inp_ff)?;
 
         // input for next layer
         inp_l = cur;
     }
 
     // norm
-    unsafe {
-        inp_l = ggml_norm(ctx0.as_ptr(), inp_l);
+    {
+        inp_l = ctx0.norm(inp_l)?;
 
         // inpL = norm*inpL
-        inp_l = ggml_mul(
-            ctx0.as_ptr(),
-            ggml_repeat(ctx0.as_ptr(), model.norm.as_ptr(), inp_l),
-            inp_l,
-        );
+        let a = ctx0.repeat(model.norm, inp_l)?;
+        inp_l = ctx0.mul(a, inp_l)?;
     }
 
     // lm_head
-    unsafe {
-        inp_l = ggml_mul_mat(ctx0.as_ptr(), model.output.as_ptr(), inp_l);
+    {
+        inp_l = ctx0.mul_mat(model.output, inp_l)?;
     }
 
     // logits -> probs
     //inpL = ggml_soft_max(ctx0.as_ptr(), inpL);
 
     // run the computation
-    unsafe { ggml_build_forward_expand(&mut gf, inp_l) };
-    unsafe { ggml_graph_compute(ctx0.as_ptr(), &mut gf) };
+    {
+        gf.build_forward_expand(inp_l);
+    };
+    {
+        ctx0.compute(&mut gf);
+    };
 
     //if (n_past%100 == 0) {
     //    ggml_graph_print   (&gf);
@@ -952,20 +802,16 @@ fn llama_eval(
 
     // return result for just the last token
     embd_w.resize(n_vocab.try_into()?, Default::default());
-    embd_w[0..n_vocab as usize].copy_from_slice(unsafe {
-        std::slice::from_raw_parts(
-            (ggml_get_data(inp_l) as *const f32)
-                .offset(isize::try_from(usize::try_from(n_vocab)? * (n - 1))?),
-            n_vocab as usize,
-        )
+    embd_w[0..n_vocab as usize].copy_from_slice({
+        let inp_l_slice = inp_l.as_mut_slice();
+        let base = usize::try_from(n_vocab)? * (n - 1);
+        &inp_l_slice[base..base + usize::try_from(n_vocab)?]
     });
 
     if *mem_per_token == 0 {
-        *mem_per_token = unsafe { ggml_used_mem(ctx0.as_ptr()) } / n;
+        *mem_per_token = ctx0.used_memory() / n;
     }
     //printf("used_mem = %zu\n", ggml_used_mem(ctx0));
-
-    unsafe { ggml_free(ctx0.as_ptr()) };
 
     Ok(())
 }
