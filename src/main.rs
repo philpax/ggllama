@@ -1034,6 +1034,8 @@ fn main() -> anyhow::Result<()> {
         );
     }
 
+    log::info!("sampling parameters: temp = {}, top_k = {}, top_p = {}, repeat_last_n = {}, repeat_penalty = {}", params.temp, params.top_k, params.top_p, params.repeat_last_n, params.repeat_penalty);
+
     let mut embd: Vec<GptVocabId> = vec![];
 
     // determine the required inference memory per token:
