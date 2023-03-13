@@ -30,23 +30,24 @@ fn main() {
     let supports_sse3 = supported_features.contains("sse3");
 
     let mut build = cc::Build::new();
-    build
-        .include(llama_path)
-        .cpp(true)
-        .file(llama_path.join("ggml.c"));
+    build.include(llama_path).file(llama_path.join("ggml.c"));
+
     // TODO: Apple Silicon support
     if [build_target::Arch::X86, build_target::Arch::X86_64].contains(&build_target.arch) {
         use build_target::Os;
         match build_target.os {
             Os::FreeBSD | Os::Haiku | Os::iOs | Os::MacOs | Os::Linux => {
-                if supports_fma {
-                    build.flag("-mfma");
-                }
+                build.flag("-DNDEBUG");
+                build.flag("-std=c11");
+                build.flag("-pthread");
                 if supports_avx {
                     build.flag("-mavx");
                 }
                 if supports_avx2 {
                     build.flag("-mavx2");
+                }
+                if supports_fma {
+                    build.flag("-mfma");
                 }
                 if supports_f16c {
                     build.flag("-mf16c");

@@ -19,7 +19,8 @@ pub trait SysType {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
-#[repr(i32)]
+#[cfg_attr(not(windows), repr(u32))]
+#[cfg_attr(windows, repr(i32))]
 pub enum Type {
     Q4_0 = ggml_sys::ggml_type_GGML_TYPE_Q4_0,
     Q4_1 = ggml_sys::ggml_type_GGML_TYPE_Q4_1,
