@@ -16,6 +16,7 @@ partial_sort = "0.2.0"
 rand = "0.8.5"
 serde_json = "1.0.94"
 simplelog = "0.12.1"
+thiserror = "1.0.39"
 
 [workspace]
 members = [".", "ggml-sys"]

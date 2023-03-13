@@ -15,14 +15,15 @@ use ggml_sys::{
     ggml_graph_compute, ggml_init, ggml_init_params, ggml_mul, ggml_mul_mat, ggml_nbytes,
     ggml_nelements, ggml_new_f32, ggml_new_tensor_1d, ggml_new_tensor_2d, ggml_new_tensor_3d,
     ggml_norm, ggml_permute, ggml_repeat, ggml_reshape_3d, ggml_rope, ggml_scale, ggml_silu,
-    ggml_soft_max, ggml_tensor, ggml_time_init, ggml_time_us, ggml_type_GGML_TYPE_F16,
-    ggml_type_GGML_TYPE_F32, ggml_type_GGML_TYPE_I32, ggml_type_GGML_TYPE_Q4_0,
-    ggml_type_GGML_TYPE_Q4_1, ggml_type_size, ggml_type_sizef, ggml_used_mem, ggml_view_1d,
+    ggml_soft_max, ggml_tensor, ggml_type_GGML_TYPE_F16, ggml_type_GGML_TYPE_F32,
+    ggml_type_GGML_TYPE_I32, ggml_type_GGML_TYPE_Q4_0, ggml_type_GGML_TYPE_Q4_1, ggml_type_size,
+    ggml_type_sizef, ggml_used_mem, ggml_view_1d,
 };
 use once_cell::sync::Lazy;
 use rand::SeedableRng;
 use utils::{llama_sample_top_p_top_k, llama_tokenize, GptParams, GptVocab, GptVocabId};
 
+mod ggml;
 mod utils;
 
 static LLAMA_N_PARTS: Lazy<HashMap<u32, u32>> =
@@ -54,7 +55,6 @@ impl Default for LlamaHParams {
     }
 }
 
-#[allow(dead_code)]
 struct LlamaLayer {
     // normalization
     attention_norm: NonNull<ggml_tensor>,
@@ -74,7 +74,6 @@ struct LlamaLayer {
     w3: NonNull<ggml_tensor>,
 }
 
-#[allow(dead_code)]
 struct LlamaModel {
     hparams: LlamaHParams,
 
@@ -89,7 +88,6 @@ struct LlamaModel {
     memory_v: NonNull<ggml_tensor>,
 
     ctx: NonNull<ggml_context>,
-    tensors: HashMap<String, NonNull<ggml_tensor>>,
 }
 impl Drop for LlamaModel {
     fn drop(&mut self) {
@@ -289,7 +287,7 @@ impl LlamaModel {
                     .context("failed to create output")?;
 
             // map by name
-            let mut tensors = HashMap::default();
+            let mut tensors: HashMap<String, NonNull<ggml_tensor>> = HashMap::default();
             tensors.insert("tok_embeddings.weight".to_string(), tok_embeddings);
 
             tensors.insert("norm.weight".to_string(), norm);
@@ -649,7 +647,6 @@ impl LlamaModel {
             memory_k,
             memory_v,
             ctx,
-            tensors,
         })
     }
 }
@@ -981,9 +978,9 @@ fn main() -> anyhow::Result<()> {
         simplelog::ColorChoice::Auto,
     )])?;
 
-    unsafe { ggml_time_init() };
+    ggml::time::init();
 
-    let t_main_start_us = unsafe { ggml_time_us() };
+    let t_main_start_us = ggml::time::us();
 
     let mut params = GptParams::parse();
     params.seed = match params.seed {
@@ -1005,9 +1002,9 @@ fn main() -> anyhow::Result<()> {
 
     // load the model
     let model = {
-        let t_start_us = unsafe { ggml_time_us() };
+        let t_start_us = ggml::time::us();
         let model = LlamaModel::load(&params.model, &mut vocab, 512)?;
-        t_load_us = unsafe { ggml_time_us() } - t_start_us;
+        t_load_us = ggml::time::us() - t_start_us;
 
         model
     };
@@ -1057,7 +1054,7 @@ fn main() -> anyhow::Result<()> {
 
     while remaining_tokens > 0 {
         if !embd.is_empty() {
-            let t_start_us = unsafe { ggml_time_us() };
+            let t_start_us = ggml::time::us();
 
             llama_eval(
                 &model,
@@ -1068,7 +1065,7 @@ fn main() -> anyhow::Result<()> {
                 &mut mem_per_token,
             )?;
 
-            t_predict_us += unsafe { ggml_time_us() } - t_start_us;
+            t_predict_us += ggml::time::us() - t_start_us;
         }
 
         n_past += i32::try_from(embd.len())?;
@@ -1084,7 +1081,7 @@ fn main() -> anyhow::Result<()> {
             let n_vocab = model.hparams.n_vocab;
 
             let id = {
-                let t_start_sample_us = unsafe { ggml_time_us() };
+                let t_start_sample_us = ggml::time::us();
 
                 let id = llama_sample_top_p_top_k(
                     &vocab,
@@ -1100,7 +1097,7 @@ fn main() -> anyhow::Result<()> {
                 last_n_tokens.remove(0);
                 last_n_tokens.push(id);
 
-                t_sample_us += unsafe { ggml_time_us() } - t_start_sample_us;
+                t_sample_us += ggml::time::us() - t_start_sample_us;
 
                 id
             };
@@ -1132,7 +1129,7 @@ fn main() -> anyhow::Result<()> {
 
     // report timing
     {
-        let t_main_end_us = unsafe { ggml_time_us() };
+        let t_main_end_us = ggml::time::us();
 
         log::info!("mem per token = {} bytes", mem_per_token);
         log::info!("    load time = {} ms", (t_load_us as f64) / 1000.0);
