@@ -1,0 +1,54 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug executable 'ggllama'",
+      "cargo": {
+        "args": ["build", "--bin=ggllama", "--package=ggllama"],
+        "filter": {
+          "name": "ggllama",
+          "kind": "bin"
+        }
+      },
+      "args": [
+        "--model",
+        "vendor/llama.cpp/models/7B/ggml-model-q4_0.bin",
+        "Hello, my name is "
+      ],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in executable 'ggllama'",
+      "cargo": {
+        "args": ["test", "--no-run", "--bin=ggllama", "--package=ggllama"],
+        "filter": {
+          "name": "ggllama",
+          "kind": "bin"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    },
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "Debug unit tests in library 'ggml-sys'",
+      "cargo": {
+        "args": ["test", "--no-run", "--lib", "--package=ggml-sys"],
+        "filter": {
+          "name": "ggml-sys",
+          "kind": "lib"
+        }
+      },
+      "args": [],
+      "cwd": "${workspaceFolder}"
+    }
+  ]
+}
