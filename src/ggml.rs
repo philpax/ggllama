@@ -378,7 +378,7 @@ pub mod time {
         unsafe { ggml_sys::ggml_time_init() }
     }
 
-    pub fn us() -> u64 {
-        unsafe { ggml_sys::ggml_time_us() }.try_into().unwrap()
+    pub fn us() -> i64 {
+        unsafe { ggml_sys::ggml_time_us() }
     }
 }
