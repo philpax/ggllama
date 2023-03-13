@@ -4,6 +4,40 @@
 
 The current version uses `ggml` directly, so you will require a C compiler. PRs welcome to switch to a more Rust-y solution!
 
+## Does it work?
+
+Not at the time of writing, no. It runs, but the inference is garbage:
+
+```log
+23:59:53 [INFO] ℚ
+23:59:54 [INFO]  Насе
+23:59:54 [INFO] rsg
+23:59:54 [INFO]  eredetiből
+23:59:54 [INFO]  Хронологија
+23:59:55 [INFO] flug
+23:59:55 [INFO]  odkazy
+23:59:55 [INFO] orith
+23:59:55 [INFO] gior
+23:59:56 [INFO]
+23:59:56 [INFO]  logs
+23:59:56 [INFO] BeanFactory
+23:59:56 [INFO] gesamt
+23:59:56 [INFO]  bezeichneter
+23:59:57 [INFO] Webachiv
+23:59:57 [INFO] brie
+23:59:57 [INFO]  listade
+23:59:57 [INFO] ⊤
+23:59:58 [INFO] xtart
+23:59:58 [INFO]  kallaste
+23:59:58 [INFO] makeText
+23:59:58 [INFO]  eredetiből
+23:59:59 [INFO] daten
+23:59:59 [INFO]  Мос
+23:59:59 [INFO] lacht
+```
+
+It's likely that I've messed up the sampling or conversion somewhere. I'll need to debug this further.
+
 ## Build requirements
 
 `ggml-sys` is built with the target features passed into the Rust compiler, so you'll need to set your `RUSTFLAGS` appropriately:
