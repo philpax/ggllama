@@ -76,6 +76,9 @@ struct LlamaModel {
 
     memory_k: ggml::Tensor,
     memory_v: ggml::Tensor,
+
+    // Must be kept alive; tensors attached to this will be invalidated otherwise
+    _ctx: ggml::Context,
 }
 impl LlamaModel {
     fn load(fname: &Path, vocab: &mut GptVocab, n_ctx: i32) -> anyhow::Result<LlamaModel> {
@@ -574,6 +577,7 @@ impl LlamaModel {
             layers,
             memory_k,
             memory_v,
+            _ctx: ctx,
         })
     }
 }
@@ -625,8 +629,8 @@ fn llama_eval(
         .context("failed to create ctx0")?;
 
     let mut gf = ggml::ComputationGraph::new(n_threads.try_into()?)?;
-    let mut embd = ctx0.new_tensor_1d(ggml::Type::I32, n)?;
 
+    let mut embd = ctx0.new_tensor_1d(ggml::Type::I32, n)?;
     embd.as_mut_slice().copy_from_slice(embd_inp);
 
     let mut inp_l = ctx0.get_rows(model.tok_embeddings, embd)?;
