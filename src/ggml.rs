@@ -1,4 +1,4 @@
-use std::{ffi::c_void, ptr::NonNull};
+use std::{ffi::c_void, marker::PhantomData, ptr::NonNull};
 
 use thiserror::Error;
 
@@ -12,10 +12,10 @@ pub enum GgmlError {
 
 pub type Result<T> = core::result::Result<T, GgmlError>;
 
-pub trait SysType {
+trait SysType {
     type Sys;
     unsafe fn as_ptr(&self) -> *const Self::Sys;
-    unsafe fn as_mut_ptr(&mut self) -> *mut Self::Sys;
+    unsafe fn as_mut_ptr(&self) -> *mut Self::Sys;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, PartialOrd)]
@@ -29,11 +29,11 @@ pub enum Type {
     I32 = ggml_sys::ggml_type_GGML_TYPE_I32,
     F16 = ggml_sys::ggml_type_GGML_TYPE_F16,
     F32 = ggml_sys::ggml_type_GGML_TYPE_F32,
-    COUNT = ggml_sys::ggml_type_GGML_TYPE_COUNT,
+    Count = ggml_sys::ggml_type_GGML_TYPE_COUNT,
 }
 impl Type {
-    pub fn to_sys(&self) -> ggml_sys::ggml_type {
-        *self as ggml_sys::ggml_type
+    pub fn to_sys(self) -> ggml_sys::ggml_type {
+        self as ggml_sys::ggml_type
     }
     pub fn from_sys(sys: ggml_sys::ggml_type) -> Self {
         match sys {
@@ -44,7 +44,7 @@ impl Type {
             ggml_sys::ggml_type_GGML_TYPE_I32 => Self::I32,
             ggml_sys::ggml_type_GGML_TYPE_F16 => Self::F16,
             ggml_sys::ggml_type_GGML_TYPE_F32 => Self::F32,
-            ggml_sys::ggml_type_GGML_TYPE_COUNT => Self::COUNT,
+            ggml_sys::ggml_type_GGML_TYPE_COUNT => Self::Count,
             _ => unreachable!(),
         }
     }
@@ -66,17 +66,20 @@ impl Type {
 // TODO: Make this borrow from the Context so that it's impossible to keep a Tensor
 // past the lifetime of its parent Context. This can be unsound.
 #[derive(Copy, Clone)]
-pub struct Tensor(NonNull<ggml_sys::ggml_tensor>);
-impl SysType for Tensor {
+pub struct Tensor<'a>(
+    NonNull<ggml_sys::ggml_tensor>,
+    PhantomData<&'a ggml_sys::ggml_tensor>,
+);
+impl SysType for Tensor<'_> {
     type Sys = ggml_sys::ggml_tensor;
     unsafe fn as_ptr(&self) -> *const Self::Sys {
         self.0.as_ptr()
     }
-    unsafe fn as_mut_ptr(&mut self) -> *mut Self::Sys {
+    unsafe fn as_mut_ptr(&self) -> *mut Self::Sys {
         self.0.as_ptr()
     }
 }
-impl Tensor {
+impl Tensor<'_> {
     pub fn ne(&self) -> &[i32] {
         &unsafe { self.0.as_ref() }.ne
     }
@@ -151,7 +154,7 @@ impl SysType for Context {
     unsafe fn as_ptr(&self) -> *const Self::Sys {
         self.0.as_ptr()
     }
-    unsafe fn as_mut_ptr(&mut self) -> *mut Self::Sys {
+    unsafe fn as_mut_ptr(&self) -> *mut Self::Sys {
         self.0.as_ptr()
     }
 }
@@ -167,18 +170,18 @@ impl Context {
         })?))
     }
 
-    pub fn new_tensor_f32(&mut self, value: f32) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe { ggml_sys::ggml_new_f32(self.as_mut_ptr(), value) })
+    pub fn new_tensor_f32(&self, value: f32) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe { ggml_sys::ggml_new_f32(self.as_mut_ptr(), value) })
     }
 
-    pub fn new_tensor_1d(&mut self, type_: Type, ne0: usize) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
+    pub fn new_tensor_1d(&self, type_: Type, ne0: usize) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe {
             ggml_sys::ggml_new_tensor_1d(self.as_mut_ptr(), type_.to_sys(), ne0.try_into()?)
         })
     }
 
-    pub fn new_tensor_2d(&mut self, type_: Type, ne0: usize, ne1: usize) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
+    pub fn new_tensor_2d(&self, type_: Type, ne0: usize, ne1: usize) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe {
             ggml_sys::ggml_new_tensor_2d(
                 self.as_mut_ptr(),
                 type_.to_sys(),
@@ -188,14 +191,8 @@ impl Context {
         })
     }
 
-    pub fn new_tensor_3d(
-        &mut self,
-        type_: Type,
-        ne0: usize,
-        ne1: usize,
-        ne2: usize,
-    ) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
+    pub fn new_tensor_3d(&self, type_: Type, ne0: usize, ne1: usize, ne2: usize) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe {
             ggml_sys::ggml_new_tensor_3d(
                 self.as_mut_ptr(),
                 type_.to_sys(),
@@ -206,57 +203,55 @@ impl Context {
         })
     }
 
-    pub fn add(&mut self, mut a: Tensor, mut b: Tensor) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
+    pub fn add(&self, a: Tensor, b: Tensor) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe {
             ggml_sys::ggml_add(self.as_mut_ptr(), a.as_mut_ptr(), b.as_mut_ptr())
         })
     }
 
-    pub fn cpy(&mut self, mut a: Tensor, mut b: Tensor) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
+    pub fn cpy(&self, a: Tensor, b: Tensor) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe {
             ggml_sys::ggml_cpy(self.as_mut_ptr(), a.as_mut_ptr(), b.as_mut_ptr())
         })
     }
 
-    pub fn diag_mask_inf(&mut self, mut a: Tensor, n_past: usize) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
+    pub fn diag_mask_inf(&self, a: Tensor, n_past: usize) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe {
             ggml_sys::ggml_diag_mask_inf(self.as_mut_ptr(), a.as_mut_ptr(), n_past.try_into()?)
         })
     }
 
-    pub fn get_rows(&mut self, mut a: Tensor, mut b: Tensor) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
+    pub fn get_rows(&self, a: Tensor, b: Tensor) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe {
             ggml_sys::ggml_get_rows(self.as_mut_ptr(), a.as_mut_ptr(), b.as_mut_ptr())
         })
     }
 
-    pub fn mul(&mut self, mut a: Tensor, mut b: Tensor) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
+    pub fn mul(&self, a: Tensor, b: Tensor) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe {
             ggml_sys::ggml_mul(self.as_mut_ptr(), a.as_mut_ptr(), b.as_mut_ptr())
         })
     }
 
-    pub fn mul_mat(&mut self, mut a: Tensor, mut b: Tensor) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
+    pub fn mul_mat(&self, a: Tensor, b: Tensor) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe {
             ggml_sys::ggml_mul_mat(self.as_mut_ptr(), a.as_mut_ptr(), b.as_mut_ptr())
         })
     }
 
-    pub fn norm(&mut self, mut a: Tensor) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
-            ggml_sys::ggml_norm(self.as_mut_ptr(), a.as_mut_ptr())
-        })
+    pub fn norm(&self, a: Tensor) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe { ggml_sys::ggml_norm(self.as_mut_ptr(), a.as_mut_ptr()) })
     }
 
     pub fn permute(
-        &mut self,
-        mut a: Tensor,
+        &self,
+        a: Tensor,
         axis0: usize,
         axis1: usize,
         axis2: usize,
         axis3: usize,
     ) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
+        self.make_tensor_from_ptr(unsafe {
             ggml_sys::ggml_permute(
                 self.as_mut_ptr(),
                 a.as_mut_ptr(),
@@ -268,20 +263,14 @@ impl Context {
         })
     }
 
-    pub fn repeat(&mut self, mut a: Tensor, mut b: Tensor) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
+    pub fn repeat(&self, a: Tensor, b: Tensor) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe {
             ggml_sys::ggml_repeat(self.as_mut_ptr(), a.as_mut_ptr(), b.as_mut_ptr())
         })
     }
 
-    pub fn reshape_3d(
-        &mut self,
-        mut a: Tensor,
-        ne0: usize,
-        ne1: usize,
-        ne2: usize,
-    ) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
+    pub fn reshape_3d(&self, a: Tensor, ne0: usize, ne1: usize, ne2: usize) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe {
             ggml_sys::ggml_reshape_3d(
                 self.as_mut_ptr(),
                 a.as_mut_ptr(),
@@ -292,14 +281,8 @@ impl Context {
         })
     }
 
-    pub fn rope(
-        &mut self,
-        mut a: Tensor,
-        n_past: usize,
-        n_dims: usize,
-        mode: i32,
-    ) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
+    pub fn rope(&self, a: Tensor, n_past: usize, n_dims: usize, mode: i32) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe {
             ggml_sys::ggml_rope(
                 self.as_mut_ptr(),
                 a.as_mut_ptr(),
@@ -310,20 +293,18 @@ impl Context {
         })
     }
 
-    pub fn scale(&mut self, mut a: Tensor, mut b: Tensor) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
+    pub fn scale(&self, a: Tensor, b: Tensor) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe {
             ggml_sys::ggml_scale(self.as_mut_ptr(), a.as_mut_ptr(), b.as_mut_ptr())
         })
     }
 
-    pub fn silu(&mut self, mut a: Tensor) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
-            ggml_sys::ggml_silu(self.as_mut_ptr(), a.as_mut_ptr())
-        })
+    pub fn silu(&self, a: Tensor) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe { ggml_sys::ggml_silu(self.as_mut_ptr(), a.as_mut_ptr()) })
     }
 
-    pub fn soft_max(&mut self, mut a: Tensor) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
+    pub fn soft_max(&self, a: Tensor) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe {
             ggml_sys::ggml_soft_max(self.as_mut_ptr(), a.as_mut_ptr())
         })
     }
@@ -332,20 +313,20 @@ impl Context {
         unsafe { ggml_sys::ggml_used_mem(self.as_ptr()) }
     }
 
-    pub fn view_1d(&mut self, mut a: Tensor, ne0: usize, offset: usize) -> Result<Tensor> {
-        Self::make_tensor_from_ptr(unsafe {
+    pub fn view_1d(&self, a: Tensor, ne0: usize, offset: usize) -> Result<Tensor> {
+        self.make_tensor_from_ptr(unsafe {
             ggml_sys::ggml_view_1d(self.as_mut_ptr(), a.as_mut_ptr(), ne0.try_into()?, offset)
         })
     }
 
-    pub fn compute(&mut self, graph: &mut ComputationGraph) {
-        unsafe { ggml_sys::ggml_graph_compute(self.as_mut_ptr(), graph.as_mut_ptr()) };
+    pub fn compute(&self, graph: &mut ComputationGraph) {
+        unsafe { ggml_sys::ggml_graph_compute(self.as_mut_ptr(), graph.0.as_mut()) };
     }
 }
 impl Context {
-    fn make_tensor_from_ptr(ptr: *mut ggml_sys::ggml_tensor) -> Result<Tensor> {
+    fn make_tensor_from_ptr(&self, ptr: *mut ggml_sys::ggml_tensor) -> Result<Tensor<'_>> {
         NonNull::new(ptr)
-            .map(|p| Tensor(p))
+            .map(|p| Tensor(p, PhantomData))
             .ok_or(GgmlError::ResourceCreationFailure)
     }
 }
@@ -368,17 +349,8 @@ impl ComputationGraph {
         })))
     }
 
-    pub fn build_forward_expand(&mut self, mut tensor: Tensor) {
-        unsafe { ggml_sys::ggml_build_forward_expand(self.as_mut_ptr(), tensor.as_mut_ptr()) };
-    }
-}
-impl SysType for ComputationGraph {
-    type Sys = ggml_sys::ggml_cgraph;
-    unsafe fn as_ptr(&self) -> *const Self::Sys {
-        self.0.as_ref()
-    }
-    unsafe fn as_mut_ptr(&mut self) -> *mut Self::Sys {
-        self.0.as_mut()
+    pub fn build_forward_expand(&mut self, tensor: Tensor) {
+        unsafe { ggml_sys::ggml_build_forward_expand(self.0.as_mut(), tensor.as_mut_ptr()) };
     }
 }
 

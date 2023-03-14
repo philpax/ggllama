@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fs::File,
     io::{Read, Seek, SeekFrom},
-    path::Path,
+    path::{Path, PathBuf},
     ptr::NonNull,
     sync::Mutex,
 };
@@ -18,6 +18,45 @@ mod utils;
 
 static LLAMA_N_PARTS: Lazy<HashMap<u32, u32>> =
     Lazy::new(|| HashMap::from_iter([(4096, 1), (5120, 2), (6656, 4), (8192, 8)]));
+
+fn read_i32(f: &mut File) -> std::io::Result<Option<i32>> {
+    let mut out = [0u8; 4];
+    if f.read(&mut out)? == 0 {
+        return Ok(None);
+    };
+    Ok(Some(i32::from_le_bytes(out)))
+}
+
+fn read_u32(f: &mut File) -> std::io::Result<Option<u32>> {
+    let mut out = [0u8; 4];
+    if f.read(&mut out)? == 0 {
+        return Ok(None);
+    };
+    Ok(Some(u32::from_le_bytes(out)))
+}
+
+fn read_string_with_len(f: &mut File, len: usize) -> anyhow::Result<Option<String>> {
+    let mut string_buf = vec![0u8; len];
+    if f.read(&mut string_buf)? == 0 {
+        return Ok(None);
+    };
+
+    Ok(Some(String::from_utf8(string_buf)?))
+}
+
+fn read_string(f: &mut File) -> anyhow::Result<Option<String>> {
+    let len = usize::try_from(read_u32(f)?.context("eof while reading string")?)?;
+    if len == 0 {
+        return Ok(Some(String::new()));
+    }
+    read_string_with_len(f, len)
+}
+
+fn read_into_slice(f: &mut File, slice: &mut [u8]) -> anyhow::Result<()> {
+    let read_len = f.read(slice)?;
+    assert_eq!(read_len, slice.len());
+    Ok(())
+}
 
 struct LlamaHParams {
     n_vocab: i32,
@@ -45,98 +84,61 @@ impl Default for LlamaHParams {
     }
 }
 
-struct LlamaLayer {
+struct LlamaLayer<'a> {
     // normalization
-    attention_norm: ggml::Tensor,
+    attention_norm: ggml::Tensor<'a>,
 
     // attention
-    wq: ggml::Tensor,
-    wk: ggml::Tensor,
-    wv: ggml::Tensor,
-    wo: ggml::Tensor,
+    wq: ggml::Tensor<'a>,
+    wk: ggml::Tensor<'a>,
+    wv: ggml::Tensor<'a>,
+    wo: ggml::Tensor<'a>,
 
     // normalization
-    ffn_norm: ggml::Tensor,
+    ffn_norm: ggml::Tensor<'a>,
 
     // ff
-    w1: ggml::Tensor,
-    w2: ggml::Tensor,
-    w3: ggml::Tensor,
+    w1: ggml::Tensor<'a>,
+    w2: ggml::Tensor<'a>,
+    w3: ggml::Tensor<'a>,
 }
 
-struct LlamaModel {
+struct LlamaModel<'a> {
     hparams: LlamaHParams,
 
-    tok_embeddings: ggml::Tensor,
+    tok_embeddings: ggml::Tensor<'a>,
 
-    norm: ggml::Tensor,
-    output: ggml::Tensor,
+    norm: ggml::Tensor<'a>,
+    output: ggml::Tensor<'a>,
 
-    layers: Vec<LlamaLayer>,
+    layers: Vec<LlamaLayer<'a>>,
 
-    memory_k: ggml::Tensor,
-    memory_v: ggml::Tensor,
-
-    // Must be kept alive; tensors attached to this will be invalidated otherwise
-    _ctx: ggml::Context,
+    memory_k: ggml::Tensor<'a>,
+    memory_v: ggml::Tensor<'a>,
 }
-impl LlamaModel {
-    fn load(fname: &Path, vocab: &mut GptVocab, n_ctx: i32) -> anyhow::Result<LlamaModel> {
-        const PRINT_LAYERS: bool = false;
-
+struct LlamaLoad {
+    fname: PathBuf,
+    file_offset: u64,
+    n_ff: i32,
+    n_parts: u32,
+    hparams: LlamaHParams,
+    wtype: ggml::Type,
+}
+impl LlamaModel<'_> {
+    fn load(
+        fname: &Path,
+        n_ctx: i32,
+        vocab: &mut GptVocab,
+    ) -> anyhow::Result<(ggml::Context, LlamaLoad)> {
         log::info!("loading model from {fname:?} - please wait ...");
-
-        fn read_i32(f: &mut File) -> std::io::Result<Option<i32>> {
-            let mut out = [0u8; 4];
-            if f.read(&mut out)? == 0 {
-                return Ok(None);
-            };
-            Ok(Some(i32::from_le_bytes(out)))
-        }
-
-        fn read_u32(f: &mut File) -> std::io::Result<Option<u32>> {
-            let mut out = [0u8; 4];
-            if f.read(&mut out)? == 0 {
-                return Ok(None);
-            };
-            Ok(Some(u32::from_le_bytes(out)))
-        }
-
-        fn read_string_with_len(f: &mut File, len: usize) -> anyhow::Result<Option<String>> {
-            let mut string_buf = vec![0u8; len];
-            if f.read(&mut string_buf)? == 0 {
-                return Ok(None);
-            };
-
-            Ok(Some(String::from_utf8(string_buf)?))
-        }
-
-        fn read_string(f: &mut File) -> anyhow::Result<Option<String>> {
-            let len = usize::try_from(read_u32(f)?.context("eof while reading string")?)?;
-            if len == 0 {
-                return Ok(Some(String::new()));
-            }
-            read_string_with_len(f, len)
-        }
-
-        fn read_into_slice(f: &mut File, slice: &mut [u8]) -> anyhow::Result<()> {
-            let read_len = f.read(slice)?;
-            assert_eq!(read_len, slice.len() as usize);
-            Ok(())
-        }
-
         let mut fin = std::fs::File::open(fname)?;
-
         {
             if read_u32(&mut fin)?.context("eof while reading magic")? != 0x67676d6c {
                 anyhow::bail!("invalid model file {fname:?} (bad magic)");
             }
         }
-
         let n_ff: i32;
         let n_parts: u32;
-
-        // load hparams
         let hparams = {
             let n_vocab = read_i32(&mut fin)?.context("eof reading n_vocab")?;
             let n_embd = read_i32(&mut fin)?.context("eof reading n_embd")?;
@@ -177,8 +179,6 @@ impl LlamaModel {
 
             hparams
         };
-
-        // load vocab
         {
             let n_vocab = hparams.n_vocab;
 
@@ -188,7 +188,6 @@ impl LlamaModel {
                 vocab.id_to_token.insert(i, word.clone());
             }
         }
-
         let wtype = match hparams.f16 {
             0 => ggml::Type::F32,
             1 => ggml::Type::F16,
@@ -201,9 +200,7 @@ impl LlamaModel {
                 );
             }
         };
-
         let mut ctx_size: usize = 0;
-
         {
             let n_embd = hparams.n_embd as f32;
             let n_layer = hparams.n_layer as f32;
@@ -242,9 +239,33 @@ impl LlamaModel {
 
             log::info!("ggml ctx size = {} MB", ctx_size as f32 / (1024.0 * 1024.0));
         }
+        let ctx = ggml::Context::new(ctx_size, None).context("failed to create ggml context")?;
+        let file_offset = fin.stream_position()?;
+        Ok((
+            ctx,
+            LlamaLoad {
+                fname: fname.to_owned(),
+                file_offset,
+                n_ff,
+                n_parts,
+                hparams,
+                wtype,
+            },
+        ))
+    }
+}
+impl LlamaLoad {
+    fn finish(self, ctx: &mut ggml::Context) -> anyhow::Result<LlamaModel<'_>> {
+        const PRINT_LAYERS: bool = false;
 
-        let mut ctx =
-            ggml::Context::new(ctx_size, None).context("failed to create ggml context")?;
+        let Self {
+            fname,
+            file_offset,
+            n_ff,
+            n_parts,
+            hparams,
+            wtype,
+        } = self;
 
         let (layers, tok_embeddings, norm, output, tensors) = {
             let n_embd = usize::try_from(hparams.n_embd)?;
@@ -331,9 +352,6 @@ impl LlamaModel {
 
             (memory_k, memory_v)
         };
-
-        let file_offset = fin.stream_position()?;
-        std::mem::drop(fin);
 
         for i in 0..n_parts {
             let part_id = i;
@@ -577,7 +595,6 @@ impl LlamaModel {
             layers,
             memory_k,
             memory_v,
-            _ctx: ctx,
         })
     }
 }
@@ -625,7 +642,7 @@ fn llama_eval(
 
     let mut buf = LLAMA_BUF.lock().unwrap();
 
-    let mut ctx0 = ggml::Context::new(buf.len(), NonNull::new(buf.as_mut_ptr()))
+    let ctx0 = ggml::Context::new(buf.len(), NonNull::new(buf.as_mut_ptr()))
         .context("failed to create ctx0")?;
 
     let mut gf = ggml::ComputationGraph::new(n_threads.try_into()?)?;
@@ -678,7 +695,7 @@ fn llama_eval(
                 ggml::Type::F32,
                 usize::try_from(n_embd / n_head)?,
                 usize::try_from(n_head)?,
-                usize::try_from(n)?,
+                n,
             )?;
             let a = ctx0.cpy(q_cur, b)?;
             let a = ctx0.rope(a, usize::try_from(n_past)?, usize::try_from(n_rot)?, 0)?;
@@ -851,9 +868,11 @@ fn main() -> anyhow::Result<()> {
     let mut vocab = GptVocab::default();
 
     // load the model
+    let (mut ctx, load_state) = LlamaModel::load(&params.model, 512, &mut vocab)?;
+
     let model = {
         let t_start_us = ggml::time::us();
-        let model = LlamaModel::load(&params.model, &mut vocab, 512)?;
+        let model = load_state.finish(&mut ctx)?;
         t_load_us = ggml::time::us() - t_start_us;
 
         model
