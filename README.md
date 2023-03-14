@@ -1,3 +1,11 @@
+# Notice
+
+[llama-rs](https://github.com/setzer22/llama-rs) beat me to the punch. I'll be contributing to that instead.
+
+The original README is preserved below.
+
+---
+
 # ggllama
 
 `ggllama` is a Rust port of [ggerganov's llama.cpp](https://github.com/ggerganov/llama.cpp), so that it can be deployed with greater ease.
