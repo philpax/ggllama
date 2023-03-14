@@ -36,7 +36,7 @@ Not at the time of writing, no. It runs, but the inference is garbage:
 23:59:59 [INFO] lacht
 ```
 
-It's likely that I've messed up the sampling or conversion somewhere. I'll need to debug this further.
+The evaluation returns the wrong logits when given input to process. I'll need to debug this further.
 
 ## Build requirements
 
