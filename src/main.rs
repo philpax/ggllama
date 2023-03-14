@@ -16,9 +16,9 @@ pub struct Params {
     pub n_threads: Option<usize>,
     /// new tokens to predict
     #[arg(long, default_value_t = 128)]
-    pub n_predict: i32,
+    pub n_predict: usize,
     #[arg(long, default_value_t = 64)]
-    pub repeat_last_n: i32,
+    pub repeat_last_n: usize,
 
     /// sampling parameters
     #[arg(long, default_value_t = 40)]
@@ -32,7 +32,7 @@ pub struct Params {
 
     /// batch size for prompt processing
     #[arg(long, default_value_t = 8)]
-    pub n_batch: i32,
+    pub n_batch: usize,
 
     /// model path
     #[arg(short, long, default_value = "models/7B/ggml-model-q4_0.bin")]
@@ -92,9 +92,7 @@ fn main() -> anyhow::Result<()> {
 
     let embd_inp = vocabulary.tokenize(&params.prompt, true);
 
-    params.n_predict = params
-        .n_predict
-        .min(model.n_ctx() - i32::try_from(embd_inp.len())?);
+    params.n_predict = params.n_predict.min(model.n_ctx() - embd_inp.len());
 
     log::info!("prompt: '{}'", params.prompt);
     log::info!("number of tokens in prompt = {}", embd_inp.len());
@@ -124,7 +122,7 @@ fn main() -> anyhow::Result<()> {
         &mut mem_per_token,
     )?;
 
-    let last_n_size = usize::try_from(params.repeat_last_n)?;
+    let last_n_size = params.repeat_last_n;
     let mut last_n_tokens = vec![0; last_n_size];
 
     let mut remaining_tokens = params.n_predict;
@@ -145,7 +143,7 @@ fn main() -> anyhow::Result<()> {
             t_predict_us += ggml::time::us() - t_start_us;
         }
 
-        n_past += i32::try_from(embd.len())?;
+        n_past += embd.len();
         embd.clear();
 
         if embd_inp.len() <= input_consumed {
@@ -182,7 +180,7 @@ fn main() -> anyhow::Result<()> {
                 last_n_tokens.push(embd_inp[input_consumed]);
                 input_consumed += 1;
 
-                if embd.len() > usize::try_from(params.n_batch)? {
+                if embd.len() > params.n_batch {
                     break;
                 }
             }

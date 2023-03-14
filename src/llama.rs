@@ -12,7 +12,7 @@ use std::{
     sync::Mutex,
 };
 
-static LLAMA_N_PARTS: Lazy<HashMap<u32, u32>> =
+static LLAMA_N_PARTS: Lazy<HashMap<usize, usize>> =
     Lazy::new(|| HashMap::from_iter([(4096, 1), (5120, 2), (6656, 4), (8192, 8)]));
 
 pub type VocabularyId = i32;
@@ -32,17 +32,17 @@ pub struct Model<'a> {
     memory_v: ggml::Tensor<'a>,
 }
 impl Model<'_> {
-    pub fn n_ctx(&self) -> i32 {
+    pub fn n_ctx(&self) -> usize {
         self.hparams.n_ctx
     }
-    pub fn n_vocab(&self) -> i32 {
+    pub fn n_vocab(&self) -> usize {
         self.hparams.n_vocab
     }
 }
 impl Model<'_> {
     pub fn load(
         fname: &Path,
-        n_ctx: i32,
+        n_ctx: usize,
         vocab: &mut Vocabulary,
     ) -> anyhow::Result<(ggml::Context, Preload)> {
         log::info!("loading model from {fname:?} - please wait ...");
@@ -52,18 +52,17 @@ impl Model<'_> {
                 anyhow::bail!("invalid model file {fname:?} (bad magic)");
             }
         }
-        let n_ff: i32;
-        let n_parts: u32;
+
         let hparams = {
-            let n_vocab = read_i32(&mut fin)?.context("eof reading n_vocab")?;
-            let n_embd = read_i32(&mut fin)?.context("eof reading n_embd")?;
-            let n_mult = read_i32(&mut fin)?.context("eof reading n_mult")?;
-            let n_head = read_i32(&mut fin)?.context("eof reading n_head")?;
-            let n_layer = read_i32(&mut fin)?.context("eof reading n_layer")?;
-            let n_rot = read_i32(&mut fin)?.context("eof reading n_rot")?;
+            let n_vocab = read_u32_as_usize(&mut fin)?.context("eof reading n_vocab")?;
+            let n_embd = read_u32_as_usize(&mut fin)?.context("eof reading n_embd")?;
+            let n_mult = read_u32_as_usize(&mut fin)?.context("eof reading n_mult")?;
+            let n_head = read_u32_as_usize(&mut fin)?.context("eof reading n_head")?;
+            let n_layer = read_u32_as_usize(&mut fin)?.context("eof reading n_layer")?;
+            let n_rot = read_u32_as_usize(&mut fin)?.context("eof reading n_rot")?;
             let f16 = read_i32(&mut fin)?.context("eof reading f16")?;
 
-            let hparams = Hyperparameters {
+            Hyperparameters {
                 n_vocab,
                 n_ctx,
                 n_embd,
@@ -72,30 +71,30 @@ impl Model<'_> {
                 n_layer,
                 n_rot,
                 f16,
-            };
-
-            n_ff = ((2 * (4 * hparams.n_embd) / 3 + hparams.n_mult - 1) / hparams.n_mult)
-                * hparams.n_mult;
-            n_parts = LLAMA_N_PARTS
-                .get(&(hparams.n_embd as u32))
-                .copied()
-                .context("invalid embed for n_parts")?;
-
-            log::info!("n_vocab = {}", hparams.n_vocab);
-            log::info!("n_ctx   = {}", hparams.n_ctx);
-            log::info!("n_embd  = {}", hparams.n_embd);
-            log::info!("n_mult  = {}", hparams.n_mult);
-            log::info!("n_head  = {}", hparams.n_head);
-            log::info!("n_layer = {}", hparams.n_layer);
-            log::info!("n_rot   = {}", hparams.n_rot);
-            log::info!("f16     = {}", hparams.f16);
-            log::info!("n_ff    = {}", n_ff);
-            log::info!("n_parts = {}", n_parts);
-
-            hparams
+            }
         };
+
+        let n_ff =
+            ((2 * (4 * hparams.n_embd) / 3 + hparams.n_mult - 1) / hparams.n_mult) * hparams.n_mult;
+
+        let n_parts = LLAMA_N_PARTS
+            .get(&hparams.n_embd)
+            .copied()
+            .context("invalid embed for n_parts")?;
+
+        log::info!("n_vocab = {}", hparams.n_vocab);
+        log::info!("n_ctx   = {}", hparams.n_ctx);
+        log::info!("n_embd  = {}", hparams.n_embd);
+        log::info!("n_mult  = {}", hparams.n_mult);
+        log::info!("n_head  = {}", hparams.n_head);
+        log::info!("n_layer = {}", hparams.n_layer);
+        log::info!("n_rot   = {}", hparams.n_rot);
+        log::info!("f16     = {}", hparams.f16);
+        log::info!("n_ff    = {}", n_ff);
+        log::info!("n_parts = {}", n_parts);
+
         {
-            let n_vocab = hparams.n_vocab;
+            let n_vocab = VocabularyId::try_from(hparams.n_vocab)?;
 
             for i in 0..n_vocab {
                 let word = read_string(&mut fin)?.context("eof while reading vocab")?;
@@ -103,6 +102,7 @@ impl Model<'_> {
                 vocab.id_to_token.insert(i, word.clone());
             }
         }
+
         let wtype = match hparams.f16 {
             0 => ggml::Type::F32,
             1 => ggml::Type::F16,
@@ -179,7 +179,7 @@ impl Model<'_> {
     pub fn evaluate(
         &self,
         n_threads: usize,
-        n_past: i32,
+        n_past: usize,
         embd_inp: &[VocabularyId],
         embd_w: &mut Vec<f32>,
         mem_per_token: &mut usize,
@@ -197,7 +197,6 @@ impl Model<'_> {
 
         if *mem_per_token > 0 && *mem_per_token * n > LLAMA_BUF.lock().unwrap().len() {
             let buf_size_new = (1.1 * (*mem_per_token * n) as f32) as usize; // add 10% to account for ggml object overhead
-                                                                             //printf("\n%s: reallocating buffer from %zu to %zu bytes\n", __func__, buf_size, buf_size_new);
 
             // reallocate
             *LLAMA_BUF.lock().unwrap() = vec![0u8; buf_size_new].into_boxed_slice();
@@ -224,29 +223,27 @@ impl Model<'_> {
                 cur = ctx0.norm(inp_l)?;
 
                 // cur = attention_norm*cur
-                let a = ctx0.repeat(self.layers[il as usize].attention_norm, cur)?;
+                let a = ctx0.repeat(self.layers[il].attention_norm, cur)?;
                 cur = ctx0.mul(a, cur)?;
             }
 
             // self-attention
             {
-                let q_cur = ctx0.mul_mat(self.layers[il as usize].wq, cur)?;
-                let k_cur = ctx0.mul_mat(self.layers[il as usize].wk, cur)?;
-                let v_cur = ctx0.mul_mat(self.layers[il as usize].wv, cur)?;
+                let q_cur = ctx0.mul_mat(self.layers[il].wq, cur)?;
+                let k_cur = ctx0.mul_mat(self.layers[il].wk, cur)?;
+                let v_cur = ctx0.mul_mat(self.layers[il].wv, cur)?;
 
                 // store key and value to memory
                 if n >= 1 {
                     let k = ctx0.view_1d(
                         self.memory_k,
-                        n * usize::try_from(n_embd)?,
-                        (self.memory_k.element_size() * usize::try_from(n_embd)?)
-                            * usize::try_from(il * n_ctx + n_past)?,
+                        n * n_embd,
+                        (self.memory_k.element_size() * n_embd) * il * n_ctx + n_past,
                     )?;
                     let v = ctx0.view_1d(
                         self.memory_v,
-                        n * usize::try_from(n_embd)?,
-                        (self.memory_v.element_size() * usize::try_from(n_embd)?)
-                            * usize::try_from(il * n_ctx + n_past)?,
+                        n * n_embd,
+                        (self.memory_v.element_size() * n_embd) * il * n_ctx + n_past,
                     )?;
 
                     gf.build_forward_expand(ctx0.cpy(k_cur, k)?);
@@ -254,29 +251,19 @@ impl Model<'_> {
                 }
 
                 // Q = Qcur.contiguous().view(n_embd/n_head, n_head, N).permute(0, 2, 1, 3)
-                let b = ctx0.new_tensor_3d(
-                    ggml::Type::F32,
-                    usize::try_from(n_embd / n_head)?,
-                    usize::try_from(n_head)?,
-                    n,
-                )?;
+                let b = ctx0.new_tensor_3d(ggml::Type::F32, n_embd / n_head, n_head, n)?;
                 let a = ctx0.cpy(q_cur, b)?;
-                let a = ctx0.rope(a, usize::try_from(n_past)?, usize::try_from(n_rot)?, 0)?;
+                let a = ctx0.rope(a, n_past, n_rot, 0)?;
                 let q = ctx0.permute(a, 0, 2, 1, 3)?;
 
                 // K = Kmem.view(n_embd/n_head, n_head, n_past + N).permute(0, 2, 1, 3)
                 let a = ctx0.view_1d(
                     self.memory_k,
-                    (usize::try_from(n_past)? + n) * usize::try_from(n_embd)?,
-                    usize::try_from(il * n_ctx * n_embd)? * self.memory_k.element_size(),
+                    (n_past + n) * n_embd,
+                    (il * n_ctx * n_embd) * self.memory_k.element_size(),
                 )?;
-                let a = ctx0.reshape_3d(
-                    a,
-                    usize::try_from(n_embd / n_head)?,
-                    usize::try_from(n_head)?,
-                    usize::try_from(n_past)? + n,
-                )?;
-                let a = ctx0.rope(a, usize::try_from(n_past)?, usize::try_from(n_rot)?, 1)?;
+                let a = ctx0.reshape_3d(a, n_embd / n_head, n_head, n_past + n)?;
+                let a = ctx0.rope(a, n_past, n_rot, 1)?;
                 let k = ctx0.permute(a, 0, 2, 1, 3)?;
 
                 // K * Q
@@ -295,15 +282,10 @@ impl Model<'_> {
                 // V_trans = Vmem.view(n_embd/n_head, n_head, n_past + N).permute(1, 2, 0, 3).contiguous()
                 let a = ctx0.view_1d(
                     self.memory_v,
-                    (usize::try_from(n_past)? + n) * usize::try_from(n_embd)?,
-                    usize::try_from(il * n_ctx * n_embd)? * self.memory_v.element_size(),
+                    (n_past + n) * n_embd,
+                    (il * n_ctx * n_embd) * self.memory_v.element_size(),
                 )?;
-                let a = ctx0.reshape_3d(
-                    a,
-                    usize::try_from(n_embd / n_head)?,
-                    usize::try_from(n_head)?,
-                    usize::try_from(n_past)? + n,
-                )?;
+                let a = ctx0.reshape_3d(a, n_embd / n_head, n_head, n_past + n)?;
                 let v_trans = ctx0.permute(a, 1, 2, 0, 3)?;
 
                 // KQV = transpose(V) * KQ_soft_max
@@ -313,11 +295,11 @@ impl Model<'_> {
                 let kqv_merged = ctx0.permute(kqv, 0, 2, 1, 3)?;
 
                 // cur = KQV_merged.contiguous().view(n_embd, N)
-                let b = ctx0.new_tensor_2d(ggml::Type::F32, usize::try_from(n_embd)?, n)?;
+                let b = ctx0.new_tensor_2d(ggml::Type::F32, n_embd, n)?;
                 cur = ctx0.cpy(kqv_merged, b)?;
 
                 // projection (no bias)
-                cur = ctx0.mul_mat(self.layers[il as usize].wo, cur)?;
+                cur = ctx0.mul_mat(self.layers[il].wo, cur)?;
             }
 
             let inp_ff = ctx0.add(cur, inp_sa)?;
@@ -329,20 +311,20 @@ impl Model<'_> {
                     cur = ctx0.norm(inp_ff)?;
 
                     // cur = ffn_norm*cur
-                    let a = ctx0.repeat(self.layers[il as usize].ffn_norm, cur)?;
+                    let a = ctx0.repeat(self.layers[il].ffn_norm, cur)?;
                     cur = ctx0.mul(a, cur)?;
                 }
 
-                let tmp = ctx0.mul_mat(self.layers[il as usize].w3, cur)?;
+                let tmp = ctx0.mul_mat(self.layers[il].w3, cur)?;
 
-                cur = ctx0.mul_mat(self.layers[il as usize].w1, cur)?;
+                cur = ctx0.mul_mat(self.layers[il].w1, cur)?;
 
                 // SILU activation
                 cur = ctx0.silu(cur)?;
 
                 cur = ctx0.mul(cur, tmp)?;
 
-                cur = ctx0.mul_mat(self.layers[il as usize].w2, cur)?;
+                cur = ctx0.mul_mat(self.layers[il].w2, cur)?;
             }
 
             cur = ctx0.add(cur, inp_ff)?;
@@ -378,10 +360,10 @@ impl Model<'_> {
 
         // return result for just the last token
         embd_w.resize(n_vocab.try_into()?, Default::default());
-        embd_w[0..n_vocab as usize].copy_from_slice({
+        embd_w[0..n_vocab].copy_from_slice({
             let inp_l_slice = inp_l.as_mut_slice();
-            let base = usize::try_from(n_vocab)? * (n - 1);
-            &inp_l_slice[base..base + usize::try_from(n_vocab)?]
+            let base = n_vocab * (n - 1);
+            &inp_l_slice[base..base + n_vocab]
         });
 
         if *mem_per_token == 0 {
@@ -395,8 +377,8 @@ impl Model<'_> {
 pub struct Preload {
     fname: PathBuf,
     file_offset: u64,
-    n_ff: i32,
-    n_parts: u32,
+    n_ff: usize,
+    n_parts: usize,
     hparams: Hyperparameters,
     wtype: ggml::Type,
 }
@@ -414,11 +396,11 @@ impl Preload {
         } = self;
 
         let (layers, tok_embeddings, norm, output, tensors) = {
-            let n_embd = usize::try_from(hparams.n_embd)?;
-            let n_layer = usize::try_from(hparams.n_layer)?;
+            let n_embd = hparams.n_embd;
+            let n_layer = hparams.n_layer;
             // let n_ctx = hparams.n_ctx;
-            let n_vocab = usize::try_from(hparams.n_vocab)?;
-            let n_ff = usize::try_from(n_ff)?;
+            let n_vocab = hparams.n_vocab;
+            let n_ff = n_ff;
 
             let mut layers = vec![];
 
@@ -483,7 +465,7 @@ impl Preload {
             let n_ctx = hparams.n_ctx;
 
             let n_mem = n_layer * n_ctx;
-            let n_elements = usize::try_from(n_embd * n_mem)?;
+            let n_elements = n_embd * n_mem;
 
             let memory_k = ctx.new_tensor_1d(ggml::Type::F32, n_elements)?;
             let memory_v = ctx.new_tensor_1d(ggml::Type::F32, n_elements)?;
@@ -529,15 +511,17 @@ impl Preload {
                         read_i32(&mut fin)?,
                         read_i32(&mut fin)?,
                     ) {
-                        (Some(n_dims), Some(length), Some(ftype)) => (n_dims, length, ftype),
+                        (Some(n_dims), Some(length), Some(ftype)) => {
+                            (usize::try_from(n_dims)?, length, ftype)
+                        }
                         _ => break,
                     };
 
-                    let mut nelements = 1;
+                    let mut n_elements = 1usize;
                     let mut ne = [1, 1];
-                    for e in ne.iter_mut().take(usize::try_from(n_dims)?) {
+                    for e in ne.iter_mut().take(n_dims) {
                         *e = read_i32(&mut fin)?.context("eof while reading ne")?;
-                        nelements *= *e;
+                        n_elements *= usize::try_from(*e)?;
                     }
 
                     let name = read_string_with_len(&mut fin, length.try_into()?)?
@@ -583,32 +567,31 @@ impl Preload {
                     let mut tensor = *tensors.get(&name).unwrap();
 
                     if n_dims == 1 {
-                        if tensor.n_elements()? != usize::try_from(nelements)? {
+                        if tensor.n_elements()? != n_elements {
                             anyhow::bail!("tensor {} has wrong size in model file", name);
                         }
-                    } else if tensor.n_elements()? / usize::try_from(n_parts)?
-                        != usize::try_from(nelements)?
-                    {
+                    } else if tensor.n_elements()? / n_parts != n_elements {
                         anyhow::bail!("tensor {} has wrong size in model file", name);
                     }
 
                     {
+                        let tne = tensor.ne();
+                        let (ne0, ne1) = (usize::try_from(ne[0])?, usize::try_from(ne[1])?);
+                        let (tne0, tne1) = (usize::try_from(tne[0])?, usize::try_from(tne[1])?);
+
                         if n_dims == 1 {
-                            if tensor.ne()[0] != ne[0] || tensor.ne()[1] != ne[1] {
+                            if tne0 != ne0 || tne1 != ne1 {
                                 anyhow::bail!("tensor {} has wrong shape in model file: got [{}, {}], expected [{}, {}]",
-                                     name, tensor.ne()[0], tensor.ne()[1], ne[0], ne[1]);
+                                     name, tne0, tne1, ne0, ne1);
                             }
                         } else if split_type == 0 {
-                            if tensor.ne()[0] / (n_parts as i32) != ne[0] || tensor.ne()[1] != ne[1]
-                            {
+                            if tne0 / n_parts != ne0 || tne1 != ne1 {
                                 anyhow::bail!("tensor {} has wrong shape in model file: got [{}, {}], expected [{}, {}]",
-                                     name, tensor.ne()[0]/(n_parts as i32), tensor.ne()[1], ne[0], ne[1]);
+                                     name, tne0/n_parts, tne1, ne0, ne1);
                             }
-                        } else if tensor.ne()[0] != ne[0]
-                            || tensor.ne()[1] / (n_parts as i32) != ne[1]
-                        {
+                        } else if tne0 != ne0 || tne1 / n_parts != ne1 {
                             anyhow::bail!("tensor {} has wrong shape in model file: got [{}, {}], expected [{}, {}]",
-                                 name, tensor.ne()[0], tensor.ne()[1]/(n_parts as i32), ne[0], ne[1]);
+                                 name, tne0, tne1/n_parts, ne0, ne1);
                         }
                     }
 
@@ -640,14 +623,13 @@ impl Preload {
 
                     {
                         if n_dims == 1 || n_parts == 1 {
-                            if (usize::try_from(nelements)? * bpe) / tensor.type_().blck_size()?
-                                != tensor.n_bytes()
+                            if (n_elements * bpe) / tensor.type_().blck_size()? != tensor.n_bytes()
                             {
                                 anyhow::bail!(
                                     "tensor '{}' has wrong size in model file: got {}, expected {}",
                                     name,
                                     tensor.n_bytes(),
-                                    nelements * i32::try_from(bpe)?
+                                    n_elements * bpe
                                 );
                             }
 
@@ -659,14 +641,14 @@ impl Preload {
 
                             total_size += tensor.n_bytes();
                         } else {
-                            if (usize::try_from(nelements)? * bpe) / tensor.type_().blck_size()?
-                                != (tensor.n_bytes() / usize::try_from(n_parts)?)
+                            if (n_elements * bpe) / tensor.type_().blck_size()?
+                                != (tensor.n_bytes() / n_parts)
                             {
                                 anyhow::bail!(
                                     "tensor '{}' has wrong size in model file: got {}, expected {}",
                                     name,
-                                    tensor.n_bytes() / usize::try_from(n_parts)?,
-                                    nelements * i32::try_from(bpe)?
+                                    tensor.n_bytes() / n_parts,
+                                    n_elements * bpe
                                 );
                             }
 
@@ -681,15 +663,14 @@ impl Preload {
                                 for i1 in 0..ne[1] {
                                     let offset_row = usize::try_from(i1)? * row_size;
                                     let offset = offset_row
-                                        + (usize::try_from(part_id)? * usize::try_from(np0)?)
+                                        + (part_id * usize::try_from(np0)?)
                                             / tensor.type_().blck_size()?
                                             * tensor.type_().size();
 
                                     let slice = tensor.as_mut_slice_u8();
                                     read_into_slice(
                                         &mut fin,
-                                        &mut slice[offset
-                                            ..offset + (row_size / usize::try_from(n_parts)?)],
+                                        &mut slice[offset..offset + (row_size / n_parts)],
                                     )?;
                                 }
                             } else {
@@ -701,9 +682,7 @@ impl Preload {
 
                                 for i1 in 0..ne[1] {
                                     let offset_row = usize::try_from(i1)?
-                                        + usize::try_from(part_id)?
-                                            * usize::try_from(np1)?
-                                            * row_size;
+                                        + part_id * usize::try_from(np1)? * row_size;
 
                                     let slice = tensor.as_mut_slice_u8();
                                     read_into_slice(
@@ -714,7 +693,7 @@ impl Preload {
                             }
                         }
 
-                        total_size += tensor.n_bytes() / usize::try_from(n_parts)?;
+                        total_size += tensor.n_bytes() / n_parts;
                     }
 
                     n_tensors += 1;
@@ -902,14 +881,14 @@ struct Layer<'a> {
 }
 
 struct Hyperparameters {
-    n_vocab: i32,
+    n_vocab: usize,
     // this is provided as user input?
-    n_ctx: i32,
-    n_embd: i32,
-    n_mult: i32,
-    n_head: i32,
-    n_layer: i32,
-    n_rot: i32,
+    n_ctx: usize,
+    n_embd: usize,
+    n_mult: usize,
+    n_head: usize,
+    n_layer: usize,
+    n_rot: usize,
     f16: i32,
 }
 impl Default for Hyperparameters {
@@ -949,6 +928,10 @@ fn read_u32(f: &mut File) -> std::io::Result<Option<u32>> {
     Ok(Some(u32::from_le_bytes(out)))
 }
 
+fn read_u32_as_usize(f: &mut File) -> anyhow::Result<Option<usize>> {
+    Ok(read_u32(f)?.map(|v| usize::try_from(v)).transpose()?)
+}
+
 fn read_string_with_len(f: &mut File, len: usize) -> anyhow::Result<Option<String>> {
     let mut string_buf = vec![0u8; len];
     if f.read(&mut string_buf)? == 0 {
@@ -959,7 +942,7 @@ fn read_string_with_len(f: &mut File, len: usize) -> anyhow::Result<Option<Strin
 }
 
 fn read_string(f: &mut File) -> anyhow::Result<Option<String>> {
-    let len = usize::try_from(read_u32(f)?.context("eof while reading string")?)?;
+    let len = read_u32_as_usize(f)?.context("eof while reading string")?;
     if len == 0 {
         return Ok(Some(String::new()));
     }
