@@ -186,14 +186,15 @@ impl Model<'_> {
     ) -> anyhow::Result<()> {
         let n = embd_inp.len();
 
-        let hparams = &self.hparams;
-
-        let n_embd = hparams.n_embd;
-        let n_layer = hparams.n_layer;
-        let n_ctx = hparams.n_ctx;
-        let n_head = hparams.n_head;
-        let n_vocab = hparams.n_vocab;
-        let n_rot = hparams.n_embd / hparams.n_head;
+        let Hyperparameters {
+            n_vocab,
+            n_ctx,
+            n_embd,
+            n_head,
+            n_layer,
+            n_rot,
+            ..
+        } = self.hparams;
 
         if *mem_per_token > 0 && *mem_per_token * n > LLAMA_BUF.lock().unwrap().len() {
             let buf_size_new = (1.1 * (*mem_per_token * n) as f32) as usize; // add 10% to account for ggml object overhead
@@ -223,8 +224,7 @@ impl Model<'_> {
                 cur = ctx0.norm(inp_l)?;
 
                 // cur = attention_norm*cur
-                let a = ctx0.repeat(self.layers[il].attention_norm, cur)?;
-                cur = ctx0.mul(a, cur)?;
+                cur = ctx0.mul(ctx0.repeat(self.layers[il].attention_norm, cur)?, cur)?;
             }
 
             // self-attention
@@ -238,12 +238,12 @@ impl Model<'_> {
                     let k = ctx0.view_1d(
                         self.memory_k,
                         n * n_embd,
-                        (self.memory_k.element_size() * n_embd) * il * n_ctx + n_past,
+                        (self.memory_k.element_size() * n_embd) * (il * n_ctx + n_past),
                     )?;
                     let v = ctx0.view_1d(
                         self.memory_v,
                         n * n_embd,
-                        (self.memory_v.element_size() * n_embd) * il * n_ctx + n_past,
+                        (self.memory_v.element_size() * n_embd) * (il * n_ctx + n_past),
                     )?;
 
                     gf.build_forward_expand(ctx0.cpy(k_cur, k)?);
@@ -251,42 +251,77 @@ impl Model<'_> {
                 }
 
                 // Q = Qcur.contiguous().view(n_embd/n_head, n_head, N).permute(0, 2, 1, 3)
-                let b = ctx0.new_tensor_3d(ggml::Type::F32, n_embd / n_head, n_head, n)?;
-                let a = ctx0.cpy(q_cur, b)?;
-                let a = ctx0.rope(a, n_past, n_rot, 0)?;
-                let q = ctx0.permute(a, 0, 2, 1, 3)?;
+                let q = ctx0.permute(
+                    ctx0.rope(
+                        ctx0.cpy(
+                            q_cur,
+                            ctx0.new_tensor_3d(ggml::Type::F32, n_embd / n_head, n_head, n)?,
+                        )?,
+                        n_past,
+                        n_rot,
+                        0,
+                    )?,
+                    0,
+                    2,
+                    1,
+                    3,
+                )?;
 
                 // K = Kmem.view(n_embd/n_head, n_head, n_past + N).permute(0, 2, 1, 3)
-                let a = ctx0.view_1d(
-                    self.memory_k,
-                    (n_past + n) * n_embd,
-                    (il * n_ctx * n_embd) * self.memory_k.element_size(),
+                let k = ctx0.permute(
+                    ctx0.rope(
+                        ctx0.reshape_3d(
+                            ctx0.view_1d(
+                                self.memory_k,
+                                (n_past + n) * n_embd,
+                                il * n_ctx * self.memory_k.element_size() * n_embd,
+                            )?,
+                            n_embd / n_head,
+                            n_head,
+                            n_past + n,
+                        )?,
+                        n_past,
+                        n_rot,
+                        1,
+                    )?,
+                    0,
+                    2,
+                    1,
+                    3,
                 )?;
-                let a = ctx0.reshape_3d(a, n_embd / n_head, n_head, n_past + n)?;
-                let a = ctx0.rope(a, n_past, n_rot, 1)?;
-                let k = ctx0.permute(a, 0, 2, 1, 3)?;
 
                 // K * Q
                 let kq = ctx0.mul_mat(k, q)?;
 
                 // KQ_scaled = KQ / sqrt(n_embd/n_head)
-                let b = ctx0.new_tensor_f32(1.0 / ((n_embd as f32) / (n_head as f32)).sqrt())?;
-                let kq_scaled = ctx0.scale(kq, b)?;
+                let kq_scaled = ctx0.scale(
+                    kq,
+                    ctx0.new_tensor_f32(1.0 / ((n_embd as f32) / (n_head as f32)).sqrt())?,
+                )?;
 
                 // KQ_masked = mask_past(KQ_scaled)
-                let kq_masked = ctx0.diag_mask_inf(kq_scaled, n_past.try_into()?)?;
+                let kq_masked = ctx0.diag_mask_inf(kq_scaled, n_past)?;
 
                 // KQ = soft_max(KQ_masked)
                 let kq_soft_max = ctx0.soft_max(kq_masked)?;
 
                 // V_trans = Vmem.view(n_embd/n_head, n_head, n_past + N).permute(1, 2, 0, 3).contiguous()
-                let a = ctx0.view_1d(
-                    self.memory_v,
-                    (n_past + n) * n_embd,
-                    (il * n_ctx * n_embd) * self.memory_v.element_size(),
+                let v_trans = ctx0.permute(
+                    ctx0.reshape_3d(
+                        ctx0.view_1d(
+                            self.memory_v,
+                            (n_past + n) * n_embd,
+                            il * n_ctx * self.memory_v.element_size() * n_embd,
+                        )?,
+                        n_embd / n_head,
+                        n_head,
+                        n_past + n,
+                    )?,
+                    1,
+                    2,
+                    0,
+                    3,
                 )?;
-                let a = ctx0.reshape_3d(a, n_embd / n_head, n_head, n_past + n)?;
-                let v_trans = ctx0.permute(a, 1, 2, 0, 3)?;
 
                 // KQV = transpose(V) * KQ_soft_max
                 let kqv = ctx0.mul_mat(v_trans, kq_soft_max)?;
@@ -295,8 +330,7 @@ impl Model<'_> {
                 let kqv_merged = ctx0.permute(kqv, 0, 2, 1, 3)?;
 
                 // cur = KQV_merged.contiguous().view(n_embd, N)
-                let b = ctx0.new_tensor_2d(ggml::Type::F32, n_embd, n)?;
-                cur = ctx0.cpy(kqv_merged, b)?;
+                cur = ctx0.cpy(kqv_merged, ctx0.new_tensor_2d(ggml::Type::F32, n_embd, n)?)?;
 
                 // projection (no bias)
                 cur = ctx0.mul_mat(self.layers[il].wo, cur)?;
@@ -311,8 +345,7 @@ impl Model<'_> {
                     cur = ctx0.norm(inp_ff)?;
 
                     // cur = ffn_norm*cur
-                    let a = ctx0.repeat(self.layers[il].ffn_norm, cur)?;
-                    cur = ctx0.mul(a, cur)?;
+                    cur = ctx0.mul(ctx0.repeat(self.layers[il].ffn_norm, cur)?, cur)?;
                 }
 
                 let tmp = ctx0.mul_mat(self.layers[il].w3, cur)?;
@@ -338,8 +371,7 @@ impl Model<'_> {
             inp_l = ctx0.norm(inp_l)?;
 
             // inpL = norm*inpL
-            let a = ctx0.repeat(self.norm, inp_l)?;
-            inp_l = ctx0.mul(a, inp_l)?;
+            inp_l = ctx0.mul(ctx0.repeat(self.norm, inp_l)?, inp_l)?;
         }
 
         // lm_head
@@ -351,20 +383,12 @@ impl Model<'_> {
         //inpL = ggml_soft_max(ctx0.as_ptr(), inpL);
 
         // run the computation
-        {
-            gf.build_forward_expand(inp_l);
-        };
-        {
-            ctx0.compute(&mut gf);
-        };
+        gf.build_forward_expand(inp_l);
+        ctx0.compute(&mut gf);
 
         // return result for just the last token
-        embd_w.resize(n_vocab.try_into()?, Default::default());
-        embd_w[0..n_vocab].copy_from_slice({
-            let inp_l_slice = inp_l.as_mut_slice();
-            let base = n_vocab * (n - 1);
-            &inp_l_slice[base..base + n_vocab]
-        });
+        embd_w.resize(n_vocab, Default::default());
+        embd_w.copy_from_slice(&inp_l.as_mut_slice()[(n_vocab * (n - 1))..]);
 
         if *mem_per_token == 0 {
             *mem_per_token = ctx0.used_memory() / n;
@@ -398,15 +422,15 @@ impl Preload {
         let (layers, tok_embeddings, norm, output, tensors) = {
             let n_embd = hparams.n_embd;
             let n_layer = hparams.n_layer;
-            // let n_ctx = hparams.n_ctx;
             let n_vocab = hparams.n_vocab;
-            let n_ff = n_ff;
 
             let mut layers = vec![];
 
             let tok_embeddings = ctx.new_tensor_2d(wtype, n_embd, n_vocab)?;
+
             let norm = ctx.new_tensor_1d(ggml::Type::F32, n_embd)?;
             let output = ctx.new_tensor_2d(wtype, n_embd, n_vocab)?;
+
             // map by name
             let mut tensors: HashMap<String, ggml::Tensor> = HashMap::default();
             tensors.insert("tok_embeddings.weight".to_string(), tok_embeddings);
@@ -507,13 +531,11 @@ impl Preload {
 
                 loop {
                     let (n_dims, length, ftype) = match (
-                        read_i32(&mut fin)?,
+                        read_u32_as_usize(&mut fin)?,
                         read_i32(&mut fin)?,
                         read_i32(&mut fin)?,
                     ) {
-                        (Some(n_dims), Some(length), Some(ftype)) => {
-                            (usize::try_from(n_dims)?, length, ftype)
-                        }
+                        (Some(n_dims), Some(length), Some(ftype)) => (n_dims, length, ftype),
                         _ => break,
                     };
 
@@ -621,75 +643,73 @@ impl Preload {
                         _ => anyhow::bail!("unknown ftype {ftype} in model file"),
                     };
 
-                    {
-                        if n_dims == 1 || n_parts == 1 {
-                            if (n_elements * bpe) / tensor.type_().blck_size()? != tensor.n_bytes()
-                            {
-                                anyhow::bail!(
-                                    "tensor '{}' has wrong size in model file: got {}, expected {}",
-                                    name,
-                                    tensor.n_bytes(),
-                                    n_elements * bpe
-                                );
-                            }
+                    if n_dims == 1 || n_parts == 1 {
+                        if (n_elements * bpe) / tensor.type_().blck_size()? != tensor.n_bytes() {
+                            anyhow::bail!(
+                                "tensor '{}' has wrong size in model file: got {}, expected {}",
+                                name,
+                                tensor.n_bytes(),
+                                n_elements * bpe
+                            );
+                        }
 
-                            if part_id == 0 {
-                                read_into_slice(&mut fin, tensor.as_mut_slice_u8())?;
-                            } else {
-                                fin.seek(SeekFrom::Current(tensor.n_bytes().try_into()?))?;
-                            }
-
-                            total_size += tensor.n_bytes();
+                        if part_id == 0 {
+                            read_into_slice(&mut fin, tensor.as_mut_slice_u8())?;
                         } else {
-                            if (n_elements * bpe) / tensor.type_().blck_size()?
-                                != (tensor.n_bytes() / n_parts)
-                            {
-                                anyhow::bail!(
-                                    "tensor '{}' has wrong size in model file: got {}, expected {}",
-                                    name,
-                                    tensor.n_bytes() / n_parts,
-                                    n_elements * bpe
-                                );
+                            fin.seek(SeekFrom::Current(tensor.n_bytes().try_into()?))?;
+                        }
+
+                        total_size += tensor.n_bytes();
+                    } else {
+                        if (n_elements * bpe) / tensor.type_().blck_size()?
+                            != (tensor.n_bytes() / n_parts)
+                        {
+                            anyhow::bail!(
+                                "tensor '{}' has wrong size in model file: got {}, expected {}",
+                                name,
+                                tensor.n_bytes() / n_parts,
+                                n_elements * bpe
+                            );
+                        }
+
+                        if split_type == 0 {
+                            let np0 = ne[0];
+
+                            let row_size = (usize::try_from(tensor.ne()[0])?
+                                / tensor.type_().blck_size()?)
+                                * tensor.type_().size();
+                            assert_eq!(row_size, tensor.nb()[1]);
+
+                            for i1 in 0..ne[1] {
+                                let offset_row = usize::try_from(i1)? * row_size;
+                                let offset = offset_row
+                                    + (part_id * usize::try_from(np0)?)
+                                        / tensor.type_().blck_size()?
+                                        * tensor.type_().size();
+
+                                let slice = tensor.as_mut_slice_u8();
+                                read_into_slice(
+                                    &mut fin,
+                                    &mut slice[offset..offset + (row_size / n_parts)],
+                                )?;
                             }
+                        } else {
+                            let np1 = ne[1];
 
-                            if split_type == 0 {
-                                let np0 = ne[0];
+                            let row_size = (usize::try_from(tensor.ne()[0])?
+                                / tensor.type_().blck_size()?)
+                                * tensor.type_().size();
 
-                                let row_size = usize::try_from(tensor.ne()[0])?
-                                    / tensor.type_().blck_size()?
-                                    * tensor.type_().size();
-                                assert_eq!(row_size, tensor.nb()[1]);
+                            for i1 in 0..ne[1] {
+                                let offset_row = (usize::try_from(i1)?
+                                    + part_id * usize::try_from(np1)?)
+                                    * row_size;
 
-                                for i1 in 0..ne[1] {
-                                    let offset_row = usize::try_from(i1)? * row_size;
-                                    let offset = offset_row
-                                        + (part_id * usize::try_from(np0)?)
-                                            / tensor.type_().blck_size()?
-                                            * tensor.type_().size();
-
-                                    let slice = tensor.as_mut_slice_u8();
-                                    read_into_slice(
-                                        &mut fin,
-                                        &mut slice[offset..offset + (row_size / n_parts)],
-                                    )?;
-                                }
-                            } else {
-                                let np1 = ne[1];
-
-                                let row_size = usize::try_from(tensor.ne()[0])?
-                                    / tensor.type_().blck_size()?
-                                    * tensor.type_().size();
-
-                                for i1 in 0..ne[1] {
-                                    let offset_row = usize::try_from(i1)?
-                                        + part_id * usize::try_from(np1)? * row_size;
-
-                                    let slice = tensor.as_mut_slice_u8();
-                                    read_into_slice(
-                                        &mut fin,
-                                        &mut slice[offset_row..offset_row + row_size],
-                                    )?;
-                                }
+                                let slice = tensor.as_mut_slice_u8();
+                                read_into_slice(
+                                    &mut fin,
+                                    &mut slice[offset_row..offset_row + row_size],
+                                )?;
                             }
                         }
 
